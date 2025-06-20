@@ -1,0 +1,10 @@
+../Core/Src/main_v1.c:92:5:main	1
+../Core/Src/main_v1.c:180:6:SystemClock_Config	3
+../Core/Src/main_v1.c:227:13:MX_TIM5_Init	5
+../Core/Src/main_v1.c:290:13:MX_DMA_Init	1
+../Core/Src/main_v1.c:308:13:MX_GPIO_Init	1
+../Core/Src/main_v1.c:324:6:DShot_PrepareBuffer	3
+../Core/Src/main_v1.c:357:6:StartDefaultTask	1
+../Core/Src/main_v1.c:375:6:DShotTask	3
+../Core/Src/main_v1.c:409:6:HAL_TIM_PeriodElapsedCallback	2
+../Core/Src/main_v1.c:427:6:Error_Handler	1

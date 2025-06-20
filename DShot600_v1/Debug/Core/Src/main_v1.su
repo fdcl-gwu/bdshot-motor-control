@@ -1,0 +1,10 @@
+../Core/Src/main_v1.c:92:5:main	8	static
+../Core/Src/main_v1.c:180:6:SystemClock_Config	88	static
+../Core/Src/main_v1.c:227:13:MX_TIM5_Init	48	static
+../Core/Src/main_v1.c:290:13:MX_DMA_Init	16	static
+../Core/Src/main_v1.c:308:13:MX_GPIO_Init	16	static
+../Core/Src/main_v1.c:324:6:DShot_PrepareBuffer	24	static
+../Core/Src/main_v1.c:357:6:StartDefaultTask	16	static
+../Core/Src/main_v1.c:375:6:DShotTask	16	static
+../Core/Src/main_v1.c:409:6:HAL_TIM_PeriodElapsedCallback	16	static
+../Core/Src/main_v1.c:427:6:Error_Handler	4	static,ignoring_inline_asm
