@@ -6,4 +6,6 @@ Bi-Directional Shot embeds an 11-bit command (or data) field, a 1-bit telemetry 
 ## 1. Sending outgoing BDShot Signals (Flight Controller --> Electronic Speed Controller)
 Outgoing signals use 
 
+Note about signal size. BDShot documentation suggests pulse lengths that led our motors not to spin. Instead, we our working code uses a "zero" pulse that is 35% of the bit length, and a "one" pulse that is 75% of the bit length. For our BDShot600 setup, the equates to a zero pulse having a length of approximately 600 nanoseconds, with one pulses having a length approximately 1.25 microseconds.
+
 ## to be continued
