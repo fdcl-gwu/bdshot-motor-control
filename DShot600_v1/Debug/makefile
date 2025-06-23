@@ -64,8 +64,8 @@ all: main-build
 main-build: DShot600_v1.elf secondary-outputs
 
 # Tool invocations
-DShot600_v1.elf DShot600_v1.map: $(OBJS) $(USER_OBJS) C:\Users\amggn\git\FDCL---DShot-Motor-Control\DShot600_v1\STM32F405RGTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "DShot600_v1.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\amggn\git\FDCL---DShot-Motor-Control\DShot600_v1\STM32F405RGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="DShot600_v1.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+DShot600_v1.elf DShot600_v1.map: $(OBJS) $(USER_OBJS) C:\Users\amggn\OneDrive\Documents\GitHub\bdshot-motor-control\DShot600_v1\STM32F405RGTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "DShot600_v1.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\amggn\OneDrive\Documents\GitHub\bdshot-motor-control\DShot600_v1\STM32F405RGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="DShot600_v1.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

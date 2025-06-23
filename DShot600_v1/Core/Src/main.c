@@ -54,7 +54,7 @@
 
 // This timing must match the ESC's telemetry bit width.
 // For BDshot, Bluejay's default is ~2.14 us per bit (for 8kHz DShot).
-#define TELEMETRY_BIT_US 1   // Adjust if needed
+#define TELEMETRY_BIT_US 0.95f  // Adjust if needed
 #define TELEMETRY_TIMEOUT_US 50 // Max wait before abort (for loss of signal)
 /* USER CODE END PD */
 
@@ -120,6 +120,7 @@ void vTaskDelay( const TickType_t xTicksToDelay );
 void delay_task_us(uint32_t us);
 void delay_us_busy(uint32_t us);
 void DWT_Init(void);
+void delay_us_precise(float us);
 
 //uint32_t us_to_ticks(uint32_t us); Problematic because in FreeRTOS with a 1 Khz cycle, 1 tick is 1 ms
 /* USER CODE END PFP */
@@ -371,6 +372,7 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -380,8 +382,17 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -399,30 +410,31 @@ static inline uint8_t read_telemetry_pin(void) {
 
 int receive_bdshot_telemetry(uint32_t *telemetry_out) {
     uint32_t value = 0;
-    uint32_t bitcount = 0;
 
-    // Wait for line to go low (start bit, up to timeout)
+    // Wait for line to go low (start bit)
     uint32_t timeout = 0;
     while (read_telemetry_pin()) {
-        delay_us_busy(1);
-        if (++timeout > TELEMETRY_TIMEOUT_US) {
-            return -1; // Timeout waiting for start bit
-        }
+        delay_us_precise(0.01f);
+        if (++timeout > TELEMETRY_TIMEOUT_US * 25)
+            return -1; // Timeout
     }
 
-    // Sample first bit (start, must be 0), ignore storing
-    delay_us_busy(TELEMETRY_BIT_US); // Wait to middle of bit
+    // Wait half a bit to center
+    //delay_us_precise(TELEMETRY_BIT_US/2.0f);
+    delay_us_precise(.10f);
 
-    // Now sample the next 20 bits (MSB first is standard)
-    for (bitcount = 0; bitcount < 20; bitcount++) {
-        value <<= 1;
-        value |= read_telemetry_pin();
+    // LSB-first: capture 20 bits
+    for (int i = 0; i < 20; i++) {
+    	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+        value |= (read_telemetry_pin() << (19-i)); // LSB-first
         delay_us_busy(TELEMETRY_BIT_US);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
     }
 
     *telemetry_out = value;
-    return 0; // Success
+    return 0;
 }
+
 
 void set_pin_input_PA0(void)
 {
@@ -518,6 +530,12 @@ void delay_us_busy(uint32_t us) {
     while ((DWT->CYCCNT - start) < cycles);
 }
 
+void delay_us_precise(float us) {
+    uint32_t cycles = (uint32_t)(SystemCoreClock * us / 1e6f);
+    uint32_t start = DWT->CYCCNT;
+    while ((DWT->CYCCNT - start) < cycles);
+}
+
 void delay_task_us(uint32_t us) {
     if (us >= 1000) {
         osDelay(us / 1000);               // RTOS yield for ms
@@ -553,6 +571,13 @@ void DWT_Init(void) {
     }
 }
 
+void print_binary(unsigned long value, int bits) {
+    for (int i = bits - 1; i >= 0; i--) {
+        putchar((value & (1UL << i)) ? '1' : '0');
+    }
+    printf("\r\n");
+}
+
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
     //HAL_UART_Receive_DMA(&huart6, telemetry_buffer, 2);
@@ -567,6 +592,99 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     //printf("UART error callback!\r\n");
 }
 
+uint8_t calculate_crc(uint16_t value_12bit, const char *protocol) {
+    if (value_12bit > 0x0FFF) return 0xFF; // invalid input
+
+    if (protocol[0] == 'B') { // BDShot
+        uint16_t value_16bit = value_12bit << 4;
+        uint16_t csum = value_16bit;
+        csum ^= (csum >> 8);
+        csum ^= (csum >> 4);
+        return (~csum) & 0xF;
+    } else if (protocol[0] == 'D') { // DShot
+        uint16_t value = value_12bit;
+        uint8_t crc = value ^ (value >> 4) ^ (value >> 8);
+        return (~crc) & 0xF;
+    }
+
+    return 0xFF; // unsupported protocol
+}
+
+uint32_t decode_gcr_mapping(uint32_t value_21bit) {
+    return value_21bit ^ (value_21bit >> 1);
+}
+
+int decode_gcr_20_to_16(uint32_t input_20bit, uint16_t *out_value) {
+    // Reverse map: index = 5-bit GCR code, value = decoded 4-bit nibble or 0xFF
+    uint8_t decoding_map[32] = {
+        [0x19] = 0x0, [0x1B] = 0x1, [0x12] = 0x2, [0x13] = 0x3,
+        [0x1D] = 0x4, [0x15] = 0x5, [0x16] = 0x6, [0x17] = 0x7,
+        [0x1A] = 0x8, [0x09] = 0x9, [0x0A] = 0xA, [0x0B] = 0xB,
+        [0x1E] = 0xC, [0x0D] = 0xD, [0x0E] = 0xE, [0x0F] = 0xF
+    };
+
+    uint16_t result = 0;
+
+    for (int i = 0; i < 4; i++) {
+        uint8_t chunk = (input_20bit >> (15 - i * 5)) & 0x1F;
+
+        if (decoding_map[chunk] > 0x0F && decoding_map[chunk] != 0x00)
+            return -1; // Invalid chunk
+
+        result = (result << 4) | decoding_map[chunk];
+    }
+
+    *out_value = result;
+    return 0;
+}
+
+int parse_edt_frame(uint16_t frame, int pole_pairs, char *type_out, float *value_out) {
+    if (frame > 0xFFFF) return -1;
+
+    uint16_t data = (frame >> 4) & 0x0FFF;
+    uint8_t crc_received = frame & 0x0F;
+    uint8_t crc_calculated = calculate_crc(data, "BDShot");
+    if (crc_received != crc_calculated) return -2;
+
+    uint8_t exponent = (data >> 9) & 0x07;
+    uint16_t base_period = data & 0x1FF;
+    uint32_t period_us = base_period << exponent;
+
+    bool is_edt = ((exponent & 1) == 0) && ((base_period & 0x100) == 0);
+
+    if (is_edt) {
+        uint8_t telemetry_type = (data >> 8) & 0xF;
+        uint8_t telemetry_value = data & 0xFF;
+
+        switch (telemetry_type) {
+            case 0x04:
+                *value_out = (float)(telemetry_value) * 0.25f;
+                if (type_out) strcpy(type_out, "Voltage (V)");
+                break;
+            case 0x0E:
+                if (type_out) strcpy(type_out, "Status Frame");
+                *value_out = telemetry_value; // raw value, parse later if needed
+                break;
+            default:
+                *value_out = telemetry_value;
+                if (type_out) sprintf(type_out, "Unknown (0x%X)", telemetry_type);
+        }
+
+        return 1; // EDT frame
+    } else {
+        if (base_period == 0 || base_period == 0x1FF) {
+            *value_out = 0;
+        } else {
+            float erpm = 60000000.0f / (float)period_us;
+            *value_out = erpm / (float)pole_pairs;
+        }
+
+        if (type_out) strcpy(type_out, "eRPM");
+        return 2; // eRPM frame
+    }
+
+    return -3;
+}
 
 /* USER CODE END 4 */
 
@@ -617,24 +735,57 @@ void DShotTask(void *argument)
 	printf("Done arming!\r\n");
     vTaskDelay(50);  // Wait 300ms (Bluejay requires for arming)
 
+
+
     //Approximately 84 ticks in 1 microsecond (Timer Clock = 84 MHz)
     printf("Throttling.\r\n");
     queue_bdshot_pulse(200, true);
     uint32_t telemetry;
+    uint16_t frame;
+    float value;
+    char label[32];
     for (;;){
       send_bdshot(TIM_CHANNEL_1);
-
-
-      delay_us_busy(30);
+      delay_us_busy(40);
       set_pin_input_PA0();
       if (receive_bdshot_telemetry(&telemetry) == 0) {
-    	  printf("Telemetry: 0x%05lX\r\n", telemetry); // 5 hex digits (20 bits), upper-case
+    	  if (telemetry & 0xFFE00000) {
+    	      printf("Telemetry contains invalid upper bits\n");
+    	  }
+    	  else{
+    		  uint32_t gcr = decode_gcr_mapping(telemetry);
+    	  }
+          /*
+          uint16_t telemetry_16_bit;
+
+          if (decode_gcr_20_to_16(gcr, &telemetry_16_bit) != 0) {
+    			// Optional: print once per N tries
+    			static int fail_count = 0;
+    			if (++fail_count % 20 == 0) {
+        			printf("Invalid GCR encoding (count=%d)\n", fail_count);
+    			}
+    			continue;
+			}
+          frame = telemetry_16_bit;
+
+          int type = parse_edt_frame(frame, 14, label, &value);
+
+          if (type == 1) {
+              printf("EDT: %s = %.2f\n", label, value);
+          } else if (type == 2) {
+              printf("Motor RPM: %.2f\n", value);
+          } else {
+              printf("Frame parse error: %d\n", type);
+          }
+          */
+    	  print_binary(telemetry,20);
       } else {
-          printf("error reading telemetry\r\n");
+          //printf("error reading telemetry\r\n");
       }
+
       set_pin_pwm_PA0();
 
-      delay_us_busy(1000);
+      delay_us_precise(1000);
     }
     while (1)
     {
