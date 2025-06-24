@@ -62,6 +62,8 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+uint16_t rpm = -1;
+
 
 /* USER CODE END PM */
 
@@ -406,6 +408,37 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void uart_print_int(UART_HandleTypeDef *huart, int value) {
+    char buf[12]; // Enough for -2147483648 + \0
+    int idx = 0;
+
+    // Handle negative numbers
+    if (value < 0) {
+        buf[idx++] = '-';
+        value = -value;
+    }
+
+    // Convert digits to ASCII in reverse
+    char temp[10];
+    int temp_idx = 0;
+    if (value == 0) {
+        temp[temp_idx++] = '0';
+    } else {
+        while (value > 0 && temp_idx < sizeof(temp)) {
+            temp[temp_idx++] = '0' + (value % 10);
+            value /= 10;
+        }
+    }
+
+    // Copy digits in correct order
+    while (temp_idx > 0) {
+        buf[idx++] = temp[--temp_idx];
+    }
+
+    // Send buffer via UART
+    HAL_UART_Transmit(huart, (uint8_t *)buf, idx, HAL_MAX_DELAY);
+}
+
 static inline uint8_t read_telemetry_pin(void) {
     return HAL_GPIO_ReadPin(TELEMETRY_GPIO_PORT, TELEMETRY_PIN) ? 1 : 0;
 }
@@ -652,7 +685,7 @@ int decode_gcr_20_to_16(uint32_t input_20bit, uint16_t *out_value) {
     return 1;
 }
 
-int parse_edt_frame(uint16_t frame, char *type_out, uint8_t *value_out) {
+int parse_edt_frame(uint16_t frame, char *type_out, float *value_out) {
     if (frame > 0xFFFF || frame < 0){
     	return -1;
     }
@@ -677,7 +710,7 @@ int parse_edt_frame(uint16_t frame, char *type_out, uint8_t *value_out) {
 
         switch (telemetry_type) {
             case 0x04:
-                *value_out = (telemetry_value) / 4;
+                *value_out = (float)(telemetry_value) / 0.25f;
                 if (type_out) strcpy(type_out, "Voltage (V)");
                 break;
             case 0x0E:
@@ -694,7 +727,7 @@ int parse_edt_frame(uint16_t frame, char *type_out, uint8_t *value_out) {
         if (base_period == 0 || base_period == 0x1FF) {
             *value_out = 0;
         } else {
-            uint8_t erpm = 60000000/ period_us;
+            float erpm = 60000000.0f / (float)period_us;
             *value_out = erpm;
         }
 
@@ -764,7 +797,7 @@ void DShotTask(void *argument)
     uint32_t telemetry;
     uint16_t telemetry_16bit;
     char telemetry_type;
-    uint8_t telemetry_value;
+    float telemetry_value;
     for (;;){
       while(dshot_running){
     	  delay_us_precise(5);
@@ -782,7 +815,9 @@ void DShotTask(void *argument)
     	  else {
               int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
               if (type == 2) {
-            	  //printf("ERPM %d\r\n", telemetry_value);
+            	  rpm = (uint16_t)(telemetry_value / 7.0);
+            	  uart_print_int(&huart6, rpm);
+            	  printf("\r\n");
               }
 
               else if (type == 1) {
@@ -793,7 +828,7 @@ void DShotTask(void *argument)
                   printf("Invalid Telemetry frame.\r\n");
               }
               else if (type == -2){
-            	  printf("Invalid CRC.\r\n");
+            	  //printf("Invalid CRC.\r\n");
               }
               else if (type == -3){
             	  printf("Something went wrong.\r\n");
