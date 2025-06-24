@@ -56,6 +56,8 @@
 // For BDshot, Bluejay's default is ~2.14 us per bit (for 8kHz DShot).
 #define TELEMETRY_BIT_US 0.95f  // Adjust if needed
 #define TELEMETRY_TIMEOUT_US 50 // Max wait before abort (for loss of signal)
+
+#define POLE_PAIRS 7
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -332,7 +334,7 @@ static void MX_USART6_UART_Init(void)
 
   /* USER CODE END USART6_Init 1 */
   huart6.Instance = USART6;
-  huart6.Init.BaudRate = 115200;
+  huart6.Init.BaudRate = 230400;
   huart6.Init.WordLength = UART_WORDLENGTH_8B;
   huart6.Init.StopBits = UART_STOPBITS_1;
   huart6.Init.Parity = UART_PARITY_NONE;
@@ -421,7 +423,7 @@ int receive_bdshot_telemetry(uint32_t *telemetry_out) {
 
     // Wait half a bit to center
     //delay_us_precise(TELEMETRY_BIT_US/2.0f);
-    delay_us_precise(.10f);
+    delay_us_precise(0.1f);
 
     // LSB-first: capture 20 bits
     for (int i = 0; i < 20; i++) {
@@ -610,36 +612,50 @@ uint8_t calculate_crc(uint16_t value_12bit, const char *protocol) {
     return 0xFF; // unsupported protocol
 }
 
-uint32_t decode_gcr_mapping(uint32_t value_21bit) {
-    return value_21bit ^ (value_21bit >> 1);
+/*
+ * @param A value that represents a 20 bit GCR that has been mapped to 21 bits.
+ * The first "starting" bit can be excluded for compatibility with a slightly cleaned 20 bit value.
+ *
+ * @return Returns the 20 bit GCR
+ */
+uint32_t decode_gcr_mapping(uint32_t value) {
+    return value ^ (value >> 1);
 }
 
+/*
+ * @param a 20 bit GCR
+ * @param b
+ *
+ * @return Returns the 20 bit GCR
+ *
+ * Initialized the whole map to 0xFF. This way, only explicitly defined entries are accepted
+ */
 int decode_gcr_20_to_16(uint32_t input_20bit, uint16_t *out_value) {
-    // Reverse map: index = 5-bit GCR code, value = decoded 4-bit nibble or 0xFF
-    uint8_t decoding_map[32] = {
-        [0x19] = 0x0, [0x1B] = 0x1, [0x12] = 0x2, [0x13] = 0x3,
-        [0x1D] = 0x4, [0x15] = 0x5, [0x16] = 0x6, [0x17] = 0x7,
-        [0x1A] = 0x8, [0x09] = 0x9, [0x0A] = 0xA, [0x0B] = 0xB,
-        [0x1E] = 0xC, [0x0D] = 0xD, [0x0E] = 0xE, [0x0F] = 0xF
-    };
+    uint8_t decoding_map[32];
+    for (int i = 0; i < 32; ++i) decoding_map[i] = 0xFF; // mark all invalid
+    decoding_map[0x19] = 0x0; decoding_map[0x1B] = 0x1; decoding_map[0x12] = 0x2;
+    decoding_map[0x13] = 0x3; decoding_map[0x1D] = 0x4; decoding_map[0x15] = 0x5;
+    decoding_map[0x16] = 0x6; decoding_map[0x17] = 0x7; decoding_map[0x1A] = 0x8;
+    decoding_map[0x09] = 0x9; decoding_map[0x0A] = 0xA; decoding_map[0x0B] = 0xB;
+    decoding_map[0x1E] = 0xC; decoding_map[0x0D] = 0xD; decoding_map[0x0E] = 0xE;
+    decoding_map[0x0F] = 0xF;
 
     uint16_t result = 0;
 
     for (int i = 0; i < 4; i++) {
         uint8_t chunk = (input_20bit >> (15 - i * 5)) & 0x1F;
-
-        if (decoding_map[chunk] > 0x0F && decoding_map[chunk] != 0x00)
-            return -1; // Invalid chunk
-
+        if (decoding_map[chunk] == 0xFF) return 0; // invalid chunk
         result = (result << 4) | decoding_map[chunk];
     }
 
     *out_value = result;
-    return 0;
+    return 1;
 }
 
-int parse_edt_frame(uint16_t frame, int pole_pairs, char *type_out, float *value_out) {
-    if (frame > 0xFFFF) return -1;
+int parse_edt_frame(uint16_t frame, char *type_out, uint8_t *value_out) {
+    if (frame > 0xFFFF || frame < 0){
+    	return -1;
+    }
 
     uint16_t data = (frame >> 4) & 0x0FFF;
     uint8_t crc_received = frame & 0x0F;
@@ -648,7 +664,10 @@ int parse_edt_frame(uint16_t frame, int pole_pairs, char *type_out, float *value
 
     uint8_t exponent = (data >> 9) & 0x07;
     uint16_t base_period = data & 0x1FF;
+    if (exponent > 12) return -3;
+
     uint32_t period_us = base_period << exponent;
+    if (period_us == 0) return -3;
 
     bool is_edt = ((exponent & 1) == 0) && ((base_period & 0x100) == 0);
 
@@ -658,7 +677,7 @@ int parse_edt_frame(uint16_t frame, int pole_pairs, char *type_out, float *value
 
         switch (telemetry_type) {
             case 0x04:
-                *value_out = (float)(telemetry_value) * 0.25f;
+                *value_out = (telemetry_value) / 4;
                 if (type_out) strcpy(type_out, "Voltage (V)");
                 break;
             case 0x0E:
@@ -675,8 +694,8 @@ int parse_edt_frame(uint16_t frame, int pole_pairs, char *type_out, float *value
         if (base_period == 0 || base_period == 0x1FF) {
             *value_out = 0;
         } else {
-            float erpm = 60000000.0f / (float)period_us;
-            *value_out = erpm / (float)pole_pairs;
+            uint8_t erpm = 60000000/ period_us;
+            *value_out = erpm;
         }
 
         if (type_out) strcpy(type_out, "eRPM");
@@ -725,12 +744,14 @@ void DShotTask(void *argument)
 	printf("TIM5 actual clk: %lu\r\n", tim5_clk);
 
 
+
+
     // Step 1: Send ARM command (value 0)
 	printf("Arming.\r\n");
 	queue_bdshot_pulse(0, true);
 	for (int i = 0; i < 3000; i++){
 		send_bdshot(TIM_CHANNEL_1);
-		delay_us_busy(1000);
+		vTaskDelay(1);
 	}
 	printf("Done arming!\r\n");
     vTaskDelay(50);  // Wait 300ms (Bluejay requires for arming)
@@ -741,51 +762,53 @@ void DShotTask(void *argument)
     printf("Throttling.\r\n");
     queue_bdshot_pulse(200, true);
     uint32_t telemetry;
-    uint16_t frame;
-    float value;
-    char label[32];
+    uint16_t telemetry_16bit;
+    char telemetry_type;
+    uint8_t telemetry_value;
     for (;;){
+      while(dshot_running){
+    	  delay_us_precise(5);
+      }
       send_bdshot(TIM_CHANNEL_1);
       delay_us_busy(40);
       set_pin_input_PA0();
       if (receive_bdshot_telemetry(&telemetry) == 0) {
-    	  if (telemetry & 0xFFE00000) {
-    	      printf("Telemetry contains invalid upper bits\n");
+    	  //print_binary(telemetry,20);
+    	  uint32_t gcr = decode_gcr_mapping(telemetry);
+    	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
+    		  //printf("Invalid GCR encoding.\r\n");
+    		  delay_us_precise(10);
     	  }
-    	  else{
-    		  uint32_t gcr = decode_gcr_mapping(telemetry);
+    	  else {
+              int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
+              if (type == 2) {
+            	  //printf("ERPM %d\r\n", telemetry_value);
+              }
+
+              else if (type == 1) {
+            	  printf("EDT\r\n");
+                  //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
+              }
+              else if (type == -1){
+                  printf("Invalid Telemetry frame.\r\n");
+              }
+              else if (type == -2){
+            	  printf("Invalid CRC.\r\n");
+              }
+              else if (type == -3){
+            	  printf("Something went wrong.\r\n");
+              }
+              else {
+            	  printf("Unknown Error.\r\n");
+              }
     	  }
-          /*
-          uint16_t telemetry_16_bit;
-
-          if (decode_gcr_20_to_16(gcr, &telemetry_16_bit) != 0) {
-    			// Optional: print once per N tries
-    			static int fail_count = 0;
-    			if (++fail_count % 20 == 0) {
-        			printf("Invalid GCR encoding (count=%d)\n", fail_count);
-    			}
-    			continue;
-			}
-          frame = telemetry_16_bit;
-
-          int type = parse_edt_frame(frame, 14, label, &value);
-
-          if (type == 1) {
-              printf("EDT: %s = %.2f\n", label, value);
-          } else if (type == 2) {
-              printf("Motor RPM: %.2f\n", value);
-          } else {
-              printf("Frame parse error: %d\n", type);
-          }
-          */
-    	  print_binary(telemetry,20);
-      } else {
-          //printf("error reading telemetry\r\n");
       }
-
+      else {
+    	  //printf("Invalid Telemetry.\r\n");
+      }
       set_pin_pwm_PA0();
 
-      delay_us_precise(1000);
+      vTaskDelay(1);
     }
     while (1)
     {
