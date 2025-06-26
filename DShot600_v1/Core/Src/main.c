@@ -102,7 +102,15 @@ uint8_t telemetry_buffer[2]; // Make sure it's global!
 #define SERIAL_QUEUE_LENGTH 10
 #define SERIAL_QUEUE_ITEM_SIZE 128
 
+typedef struct {
+    uint8_t data[SERIAL_QUEUE_ITEM_SIZE];
+    size_t length;
+} SerialMessage_t;
+
+
 osMessageQueueId_t serialQueueHandle;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -188,8 +196,7 @@ int main(void)
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  serialQueueHandle = osMessageQueueNew(SERIAL_QUEUE_LENGTH, SERIAL_QUEUE_ITEM_SIZE, NULL);
-  /* add queues, ... */
+  serialQueueHandle = osMessageQueueNew(SERIAL_QUEUE_LENGTH, sizeof(SerialMessage_t), NULL);  /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -397,13 +404,6 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF7_USART1; // USART1_RX
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -738,6 +738,22 @@ int parse_edt_frame(uint16_t frame, char *type_out, float *value_out) {
     return -3;
 }
 
+int send_binary_uart6(const void* data, size_t len)
+{
+    if (len > SERIAL_QUEUE_ITEM_SIZE)
+        len = SERIAL_QUEUE_ITEM_SIZE;
+
+    SerialMessage_t msg;
+    memcpy(msg.data, data, len);
+    msg.length = len;
+
+    if (osMessageQueuePut(serialQueueHandle, &msg, 0, 0) != osOK) {
+        return 0;
+    }
+
+    return len;
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -768,32 +784,33 @@ void StartDefaultTask(void *argument)
 void DShotTask(void *argument)
 {
   /* USER CODE BEGIN DShotTask */
-	printf("\nDShotTask Begin.\r\n");
-	printf("SystemCoreClock=%lu\r\n", SystemCoreClock);
+	//printf("\nDShotTask Begin.\r\n");
+	//printf("SystemCoreClock=%lu\r\n", SystemCoreClock);
 	uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
 	uint32_t tim5_clk = pclk1;
 	if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1)
 	    tim5_clk *= 2;
-	printf("TIM5 actual clk: %lu\r\n", tim5_clk);
+	//printf("TIM5 actual clk: %lu\r\n", tim5_clk);
 
 
 
 
     // Step 1: Send ARM command (value 0)
-	printf("Arming.\r\n");
+	//printf("Arming.\r\n");
 	queue_bdshot_pulse(0, true);
 	for (int i = 0; i < 3000; i++){
 		send_bdshot(TIM_CHANNEL_1);
 		vTaskDelay(1);
 	}
-	printf("Done arming!\r\n");
+	//printf("Done arming!\r\n");
     vTaskDelay(50);  // Wait 300ms (Bluejay requires for arming)
 
 
 
     //Approximately 84 ticks in 1 microsecond (Timer Clock = 84 MHz)
-    printf("Throttling.\r\n");
+    //printf("Throttling.\r\n");
     queue_bdshot_pulse(200, true);
+    //queue_bdshot_pulse(throttle, true);
     uint32_t telemetry;
     uint16_t telemetry_16bit;
     char telemetry_type;
@@ -806,7 +823,6 @@ void DShotTask(void *argument)
       delay_us_busy(40);
       set_pin_input_PA0();
       if (receive_bdshot_telemetry(&telemetry) == 0) {
-    	  //print_binary(telemetry,20);
     	  uint32_t gcr = decode_gcr_mapping(telemetry);
     	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
     		  //printf("Invalid GCR encoding.\r\n");
@@ -816,25 +832,29 @@ void DShotTask(void *argument)
               int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
               if (type == 2) {
             	  rpm = (uint16_t)(telemetry_value / 7.0);
-            	  uart_print_int(&huart6, rpm);
-            	  printf("\r\n");
+            	  uint8_t packet[3];
+            	  packet[0] = 0xAA;                      // Start byte
+            	  packet[1] = rpm & 0xFF;               // LSB
+            	  packet[2] = (rpm >> 8) & 0xFF;        // MSB
+            	  send_binary_uart6(packet, sizeof(packet));
+
               }
 
               else if (type == 1) {
-            	  printf("EDT\r\n");
+            	  //printf("EDT\r\n");
                   //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
               }
               else if (type == -1){
-                  printf("Invalid Telemetry frame.\r\n");
+                  //printf("Invalid Telemetry frame.\r\n");
               }
               else if (type == -2){
             	  //printf("Invalid CRC.\r\n");
               }
               else if (type == -3){
-            	  printf("Something went wrong.\r\n");
+            	  //printf("Something went wrong.\r\n");
               }
               else {
-            	  printf("Unknown Error.\r\n");
+            	  //printf("Unknown Error.\r\n");
               }
     	  }
       }
@@ -842,7 +862,6 @@ void DShotTask(void *argument)
     	  //printf("Invalid Telemetry.\r\n");
       }
       set_pin_pwm_PA0();
-
       vTaskDelay(1);
     }
     while (1)
@@ -862,15 +881,16 @@ void DShotTask(void *argument)
 void StartSerialTask(void *argument)
 {
   /* USER CODE BEGIN StartSerialTask */
-  char msg[SERIAL_QUEUE_ITEM_SIZE];
+    SerialMessage_t msg;
 
   for (;;)
   {
       // 1️⃣ Process serial debug messages
-      if (osMessageQueueGet(serialQueueHandle, msg, NULL, 10) == osOK)
-      {
-          HAL_UART_Transmit(&huart6, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+      if (osMessageQueueGet(serialQueueHandle, &msg, NULL, osWaitForever) == osOK) {
+          HAL_UART_Transmit(&huart6, msg.data, msg.length, HAL_MAX_DELAY);
       }
+      //HAL_UART_Transmit(&huart6, (uint8_t *)"SerialTask alive\r\n", 18, HAL_MAX_DELAY);
+      //osDelay(1000);  // Only for debugging; remove later
 
       osDelay(1); // Let other tasks run
   }
