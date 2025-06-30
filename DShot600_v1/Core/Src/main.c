@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Adam's BDShot Code
   ******************************************************************************
   * @attention
   *
@@ -38,16 +38,18 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define DSHOT_BIT_PERIOD_US 1.67f
 #define DSHOT_BIT_PERIOD_TICKS 140  // 1.67 µs at 84 MHz (TIM5 clock)
-#define DSHOT_BUFFER_SIZE 17
 #define DSHOT_T1L_TICKS 105 // For logic 1: LOW for 1.25 µs (inverted)
 #define DSHOT_T0L_TICKS 50   // For logic 0: LOW for 0.625 µs (inverted)
+#define DSHOT_BUFFER_SIZE 18 // 1 LOW + 16 bits + 1 LOW
+#define DSHOT_TIME_GAP_US 500 //Gap between frames (adjustable)
+#define DSHOT_FRAME_TIME_US (DSHOT_BIT_PERIOD_US * (16 + 2)) //26.72 us + 3.34 us = 30.06 us
+#define DSHOT_TOTAL_PERIOD_US (DSHOT_FRAME_TIME_US + DSHOT_TIME_GAP_US)
+#define DEBUG_MSG_MAX_LEN 64 //Max length for debug messages
+#define ARMING_DURATION_US 3000000 //3s for robust ESC arming
 
 #define THROTTLE_MINIMUM 70
-
-// Adjust these as needed!
-#define TELEMETRY_PIN        GPIO_PIN_0
-#define TELEMETRY_GPIO_PORT  GPIOA
 
 // 21 bits: 1 start (always 0), 20 data bits
 #define TELEMETRY_BITS 21
@@ -58,6 +60,9 @@
 #define TELEMETRY_TIMEOUT_US 50 // Max wait before abort (for loss of signal)
 
 #define POLE_PAIRS 7
+
+#define SERIAL_QUEUE_LENGTH 10
+#define SERIAL_QUEUE_ITEM_SIZE 128
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -70,6 +75,9 @@ uint16_t rpm = -1;
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim5;
 DMA_HandleTypeDef hdma_tim5_ch1;
+DMA_HandleTypeDef hdma_tim5_ch2;
+DMA_HandleTypeDef hdma_tim5_ch3_up;
+DMA_HandleTypeDef hdma_tim5_ch4_trig;
 
 UART_HandleTypeDef huart6;
 
@@ -95,19 +103,21 @@ const osThreadAttr_t SerialTask_attributes = {
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
-uint32_t dshot_buffer[DSHOT_BUFFER_SIZE];  // DMA buffer for DSHOT signal
-volatile uint8_t dshot_running = 0;  // Flag to indicate if DSHOT signal is active
 uint8_t telemetry_buffer[2]; // Make sure it's global!
-
-#define SERIAL_QUEUE_LENGTH 10
-#define SERIAL_QUEUE_ITEM_SIZE 128
 
 typedef struct {
     uint8_t data[SERIAL_QUEUE_ITEM_SIZE];
     size_t length;
 } SerialMessage_t;
 
-
+static uint32_t dshot_buffer_ch1[DSHOT_BUFFER_SIZE] __attribute__((aligned(4))); // DMA buffer for TIM5_CH1
+static uint32_t dshot_buffer_ch2[DSHOT_BUFFER_SIZE] __attribute__((aligned(4))); // DMA buffer for TIM5_CH2
+static uint32_t dshot_buffer_ch3[DSHOT_BUFFER_SIZE] __attribute__((aligned(4))); // DMA buffer for TIM5_CH3
+static uint32_t dshot_buffer_ch4[DSHOT_BUFFER_SIZE] __attribute__((aligned(4))); // DMA buffer for TIM5_CH4
+static volatile bool dshot_running_ch1 = false;       // Flag for CH1 DMA completion
+static volatile bool dshot_running_ch2 = false;       // Flag for CH2 DMA completion
+static volatile bool dshot_running_ch3 = false;       // Flag for CH3 DMA completion
+static volatile bool dshot_running_ch4 = false;       // Flag for CH4 DMA completion
 osMessageQueueId_t serialQueueHandle;
 
 
@@ -124,15 +134,18 @@ void DShotTask(void *argument);
 void StartSerialTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-void prepare_bdshot_buffer(uint16_t frame);
+void prepare_bdshot_buffer(uint16_t frame, uint32_t *dshot_buffer);
 uint16_t make_bdshot_frame(uint16_t value, bool telemetry);
-void queue_bdshot_pulse(uint16_t throttle, bool telemetry);
+void queue_bdshot_pulse(uint16_t throttle, bool telemetry, uint32_t *dshot_buffer);
 void send_bdshot(uint32_t channel);
 void vTaskDelay( const TickType_t xTicksToDelay );
 void delay_task_us(uint32_t us);
-void delay_us_busy(uint32_t us);
 void DWT_Init(void);
 void delay_us_precise(float us);
+uint32_t decode_gcr_mapping(uint32_t value);
+int decode_gcr_20_to_16(uint32_t input_20bit, uint16_t *out_value);
+int parse_edt_frame(uint16_t frame, char *type_out, float *value_out);
+
 
 //uint32_t us_to_ticks(uint32_t us); Problematic because in FreeRTOS with a 1 Khz cycle, 1 tick is 1 ms
 /* USER CODE END PFP */
@@ -321,6 +334,18 @@ static void MX_TIM5_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM5_Init 2 */
   /* USER CODE END TIM5_Init 2 */
   HAL_TIM_MspPostInit(&htim5);
@@ -370,9 +395,18 @@ static void MX_DMA_Init(void)
   __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  /* DMA1_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA1_Stream2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+  /* DMA1_Stream4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
 
 }
 
@@ -383,7 +417,6 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -392,16 +425,6 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : PA1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* USER CODE END MX_GPIO_Init_2 */
@@ -439,16 +462,17 @@ void uart_print_int(UART_HandleTypeDef *huart, int value) {
     HAL_UART_Transmit(huart, (uint8_t *)buf, idx, HAL_MAX_DELAY);
 }
 
-static inline uint8_t read_telemetry_pin(void) {
-    return HAL_GPIO_ReadPin(TELEMETRY_GPIO_PORT, TELEMETRY_PIN) ? 1 : 0;
+static inline uint8_t read_telemetry_pin(GPIO_TypeDef *port, uint16_t pin)
+{
+    return HAL_GPIO_ReadPin(port, pin) ? 1 : 0;
 }
 
-int receive_bdshot_telemetry(uint32_t *telemetry_out) {
+int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16_t pin) {
     uint32_t value = 0;
 
     // Wait for line to go low (start bit)
     uint32_t timeout = 0;
-    while (read_telemetry_pin()) {
+    while (read_telemetry_pin(port, pin)) {
         delay_us_precise(0.01f);
         if (++timeout > TELEMETRY_TIMEOUT_US * 25)
             return -1; // Timeout
@@ -460,46 +484,92 @@ int receive_bdshot_telemetry(uint32_t *telemetry_out) {
 
     // LSB-first: capture 20 bits
     for (int i = 0; i < 20; i++) {
-    	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
-        value |= (read_telemetry_pin() << (19-i)); // LSB-first
-        delay_us_busy(TELEMETRY_BIT_US);
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+    	//HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+        value |= (read_telemetry_pin(port, pin) << (19-i)); // LSB-first
+        delay_us_precise(TELEMETRY_BIT_US);
+        //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
     }
 
     *telemetry_out = value;
     return 0;
 }
 
+void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_out) {
+	uint32_t telemetry;
+	uint16_t telemetry_16bit;
+	char telemetry_type;
+	float telemetry_value;
+    if (receive_bdshot_telemetry(&telemetry, port, pin) == 0) {
+  	  uint32_t gcr = decode_gcr_mapping(telemetry);
+  	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
+  		  //printf("Invalid GCR encoding.\r\n");
+  		  delay_us_precise(10);
+  	  }
+  	  else {
+            int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
+            if (type == 2) {
+          	  rpm = (uint16_t)(telemetry_value / 7.0);
+          	  uint8_t packet[3];
+          	  packet[0] = 0xAA;                      // Start byte
+          	  packet[1] = rpm & 0xFF;               // LSB
+          	  packet[2] = (rpm >> 8) & 0xFF;        // MSB
+          	  packet_out = packet;
+          	  return;
 
-void set_pin_input_PA0(void)
-{
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = GPIO_PIN_0;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+            }
+
+            else if (type == 1) {
+          	  //printf("EDT\r\n");
+                //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
+            }
+            else if (type == -1){
+                //printf("Invalid Telemetry frame.\r\n");
+            }
+            else if (type == -2){
+          	  //printf("Invalid CRC.\r\n");
+            }
+            else if (type == -3){
+          	  //printf("Something went wrong.\r\n");
+            }
+            else {
+          	  //printf("Unknown Error.\r\n");
+            }
+  	  }
+    }
+    else {
+  	  //printf("Invalid Telemetry.\r\n");
+    }
 }
 
-void set_pin_pwm_PA0(void)
+//Telemetry Input
+void set_pin_input(GPIO_TypeDef *port, uint16_t pin)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Pin = pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(port, &GPIO_InitStruct);
+}
+
+//DShot Generation
+void set_pin_pwm(GPIO_TypeDef *port, uint16_t pin, uint8_t alternate)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF2_TIM5; // Alternate function for TIM5 CH1 on PA0
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    GPIO_InitStruct.Alternate = alternate;
+    HAL_GPIO_Init(port, &GPIO_InitStruct);
 }
 
-
-void prepare_bdshot_buffer(uint16_t frame)
+void prepare_bdshot_buffer(uint16_t frame, uint32_t *dshot_buffer)
 {
     uint32_t buffer_index = 0;
 
-    // 1️⃣ Insert a dummy 0 at the start to absorb the DMA skip
-    //dshot_buffer[buffer_index++] = 0;  // Dummy preload entry
+    dshot_buffer[buffer_index++] = 0;  // Dummy preload entry
 
-    // 2️⃣ Build the actual DSHOT waveform entries
+    //2Build the actual DSHOT waveform entries
     for (int i = 15; i >= 0; i--)
     {
         uint8_t bit = (frame >> i) & 0x01;
@@ -515,9 +585,7 @@ void prepare_bdshot_buffer(uint16_t frame)
         }
     }
 
-    // 3️⃣ Final low pulses (as before)
     dshot_buffer[buffer_index++] = 0;  // Final LOW
-    //dshot_buffer[buffer_index++] = 0;  // Extra delay
 }
 
 
@@ -544,42 +612,45 @@ uint16_t make_bdshot_frame(uint16_t value, bool telemetry) {
     return (frame_no_crc << 4) | crc;
 }
 
-void queue_bdshot_pulse(uint16_t throttle, bool telemetry){
+void queue_bdshot_pulse(uint16_t throttle, bool telemetry, uint32_t *dshot_buffer){
 	uint16_t frame = make_bdshot_frame(throttle, telemetry);
-	prepare_bdshot_buffer(frame);
+	prepare_bdshot_buffer(frame, dshot_buffer);
 }
 
 void send_bdshot(uint32_t channel){
-    if (HAL_TIM_PWM_Start_DMA(&htim5, channel, (uint32_t*)dshot_buffer, DSHOT_BUFFER_SIZE) != HAL_OK)
+	uint32_t *buffer = NULL;
+	switch(channel) {
+	  case TIM_CHANNEL_1: buffer = dshot_buffer_ch1; break;
+	  case TIM_CHANNEL_2: buffer = dshot_buffer_ch2; break;
+	  case TIM_CHANNEL_3: buffer = dshot_buffer_ch3; break;
+	  case TIM_CHANNEL_4: buffer = dshot_buffer_ch4; break;
+	}
+    switch (channel) {
+        case TIM_CHANNEL_1: while (dshot_running_ch1) delay_us_precise(1); break;
+        case TIM_CHANNEL_2: while (dshot_running_ch2) delay_us_precise(1); break;
+        case TIM_CHANNEL_3: while (dshot_running_ch3) delay_us_precise(1); break;
+        case TIM_CHANNEL_4: while (dshot_running_ch4) delay_us_precise(1); break;
+    }
+	if (buffer == NULL) Error_Handler();
+    if (HAL_TIM_PWM_Start_DMA(&htim5, channel, (uint32_t*)buffer, DSHOT_BUFFER_SIZE) != HAL_OK)
     {
         Error_Handler();
         printf("Error in send_bdshot()\r\n");
     }
-    //printf("%d\r\n",dshot_buffer);
-    dshot_running = 1;
+    switch (channel) {
+        case TIM_CHANNEL_1: dshot_running_ch1 = true; break;
+        case TIM_CHANNEL_2: dshot_running_ch2 = true; break;
+        case TIM_CHANNEL_3: dshot_running_ch3 = true; break;
+        case TIM_CHANNEL_4: dshot_running_ch4 = true; break;
+    }
 }
 
-void delay_us_busy(uint32_t us) {
-    uint32_t cycles = (SystemCoreClock / 1000000L) * us;
-    uint32_t start = DWT->CYCCNT;
-    while ((DWT->CYCCNT - start) < cycles);
-}
 
 void delay_us_precise(float us) {
     uint32_t cycles = (uint32_t)(SystemCoreClock * us / 1e6f);
     uint32_t start = DWT->CYCCNT;
     while ((DWT->CYCCNT - start) < cycles);
 }
-
-void delay_task_us(uint32_t us) {
-    if (us >= 1000) {
-        osDelay(us / 1000);               // RTOS yield for ms
-        delay_us_busy(us % 1000);         // busy-wait remaining µs
-    } else {
-        delay_us_busy(us);                // busy-wait only for short delays
-    }
-}
-
 
 int _write(int file, char *ptr, int len)
 {
@@ -615,10 +686,26 @@ void print_binary(unsigned long value, int bits) {
 
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
-    //HAL_UART_Receive_DMA(&huart6, telemetry_buffer, 2);
-
-    // Optionally set a flag
-    dshot_running = 0;
+    if (htim->Instance == TIM5) {
+        __disable_irq();
+        if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
+            HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_1);
+            dshot_running_ch1 = false;
+        }
+        if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+            HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_2);
+            dshot_running_ch2 = false;
+        }
+        if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3) {
+            HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_3);
+            dshot_running_ch3 = false;
+        }
+        if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_4) {
+            HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_4);
+            dshot_running_ch4 = false;
+        }
+        __enable_irq();
+    }
 }
 
 
@@ -792,76 +879,52 @@ void DShotTask(void *argument)
 	    tim5_clk *= 2;
 	//printf("TIM5 actual clk: %lu\r\n", tim5_clk);
 
-
-
-
-    // Step 1: Send ARM command (value 0)
-	//printf("Arming.\r\n");
-	queue_bdshot_pulse(0, true);
+	queue_bdshot_pulse(0, true, dshot_buffer_ch1);
+	queue_bdshot_pulse(0, true, dshot_buffer_ch2);
+	queue_bdshot_pulse(0, true, dshot_buffer_ch3);
+	queue_bdshot_pulse(0, true, dshot_buffer_ch4);
 	for (int i = 0; i < 3000; i++){
 		send_bdshot(TIM_CHANNEL_1);
+		send_bdshot(TIM_CHANNEL_2);
+	    send_bdshot(TIM_CHANNEL_3);
+	    send_bdshot(TIM_CHANNEL_4);
 		vTaskDelay(1);
 	}
-	//printf("Done arming!\r\n");
-    vTaskDelay(50);  // Wait 300ms (Bluejay requires for arming)
+	vTaskDelay(50);
 
-
-
-    //Approximately 84 ticks in 1 microsecond (Timer Clock = 84 MHz)
-    //printf("Throttling.\r\n");
-    queue_bdshot_pulse(200, true);
-    //queue_bdshot_pulse(throttle, true);
-    uint32_t telemetry;
-    uint16_t telemetry_16bit;
-    char telemetry_type;
-    float telemetry_value;
+	queue_bdshot_pulse(100, true, dshot_buffer_ch1);
+	queue_bdshot_pulse(200, true, dshot_buffer_ch2);
+	queue_bdshot_pulse(300, true, dshot_buffer_ch3);
+	queue_bdshot_pulse(400, true, dshot_buffer_ch4);
     for (;;){
-      while(dshot_running){
-    	  delay_us_precise(5);
+      while(dshot_running_ch1 || dshot_running_ch2 || dshot_running_ch3 || dshot_running_ch4){
+    	  delay_us_precise(1);
       }
       send_bdshot(TIM_CHANNEL_1);
-      delay_us_busy(40);
-      set_pin_input_PA0();
-      if (receive_bdshot_telemetry(&telemetry) == 0) {
-    	  uint32_t gcr = decode_gcr_mapping(telemetry);
-    	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
-    		  //printf("Invalid GCR encoding.\r\n");
-    		  delay_us_precise(10);
-    	  }
-    	  else {
-              int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
-              if (type == 2) {
-            	  rpm = (uint16_t)(telemetry_value / 7.0);
-            	  uint8_t packet[3];
-            	  packet[0] = 0xAA;                      // Start byte
-            	  packet[1] = rpm & 0xFF;               // LSB
-            	  packet[2] = (rpm >> 8) & 0xFF;        // MSB
-            	  send_binary_uart6(packet, sizeof(packet));
+      send_bdshot(TIM_CHANNEL_2);
+      send_bdshot(TIM_CHANNEL_3);
+      send_bdshot(TIM_CHANNEL_4);
+      delay_us_precise(40);
 
-              }
+      set_pin_input(GPIOA, GPIO_PIN_0);
+      set_pin_input(GPIOA, GPIO_PIN_1);
+      set_pin_input(GPIOA, GPIO_PIN_2);
+      set_pin_input(GPIOA, GPIO_PIN_3);
 
-              else if (type == 1) {
-            	  //printf("EDT\r\n");
-                  //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
-              }
-              else if (type == -1){
-                  //printf("Invalid Telemetry frame.\r\n");
-              }
-              else if (type == -2){
-            	  //printf("Invalid CRC.\r\n");
-              }
-              else if (type == -3){
-            	  //printf("Something went wrong.\r\n");
-              }
-              else {
-            	  //printf("Unknown Error.\r\n");
-              }
-    	  }
-      }
-      else {
-    	  //printf("Invalid Telemetry.\r\n");
-      }
-      set_pin_pwm_PA0();
+      uint8_t packet_PA0[3];
+      uint8_t packet_PA1[3];
+      uint8_t packet_PA2[3];
+      uint8_t packet_PA3[3];
+      process_bdshot_telemetry(GPIOA, GPIO_PIN_0, packet_PA0);
+      process_bdshot_telemetry(GPIOA, GPIO_PIN_1, packet_PA1);
+      process_bdshot_telemetry(GPIOA, GPIO_PIN_2, packet_PA2);
+      process_bdshot_telemetry(GPIOA, GPIO_PIN_3, packet_PA3);
+	  //send_binary_uart6(packet, sizeof(packet));
+
+      set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
+      set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
+      set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
+      set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
       vTaskDelay(1);
     }
     while (1)
@@ -881,18 +944,10 @@ void DShotTask(void *argument)
 void StartSerialTask(void *argument)
 {
   /* USER CODE BEGIN StartSerialTask */
-    SerialMessage_t msg;
-
-  for (;;)
+  /* Infinite loop */
+  for(;;)
   {
-      // 1️⃣ Process serial debug messages
-      if (osMessageQueueGet(serialQueueHandle, &msg, NULL, osWaitForever) == osOK) {
-          HAL_UART_Transmit(&huart6, msg.data, msg.length, HAL_MAX_DELAY);
-      }
-      //HAL_UART_Transmit(&huart6, (uint8_t *)"SerialTask alive\r\n", 18, HAL_MAX_DELAY);
-      //osDelay(1000);  // Only for debugging; remove later
-
-      osDelay(1); // Let other tasks run
+    osDelay(1);
   }
   /* USER CODE END StartSerialTask */
 }
