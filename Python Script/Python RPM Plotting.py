@@ -6,14 +6,14 @@ import time
 import math
 from collections import deque
 
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout
 from PyQt5.QtCore import QTimer
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 # --- Config ---
-PORT = 'COM13'
+PORT = 'COM15'
 BAUDRATE = 230400
 BUFFER_SIZE = 300
 
@@ -69,7 +69,6 @@ class SerialReader(threading.Thread):
         except serial.SerialException as e:
             print(f"Serial error: {e}")
 
-
 # --- GUI Widget ---
 class RPMPlotter(QWidget):
     def __init__(self):
@@ -81,9 +80,6 @@ class RPMPlotter(QWidget):
         self.lower_bound_buffer = deque([0]*BUFFER_SIZE, maxlen=BUFFER_SIZE)
         self.upper_bound_buffer = deque([0]*BUFFER_SIZE, maxlen=BUFFER_SIZE)
         self.lock = threading.Lock()
-
-        # throttle serial
-        self.ser = serial.Serial(PORT, BAUDRATE, timeout=1)
 
         self.init_ui()
 
@@ -102,26 +98,11 @@ class RPMPlotter(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout()
-
-        # Matplotlib canvas
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
         layout.addWidget(self.canvas)
-
-        # Add throttle controls
-        throttle_layout = QHBoxLayout()
-        self.throttle_input = QLineEdit()
-        self.throttle_input.setPlaceholderText("Enter throttle (0–2047)")
-        self.send_button = QPushButton("Send Throttle")
-        self.send_button.clicked.connect(self.send_throttle)
-
-        throttle_layout.addWidget(self.throttle_input)
-        throttle_layout.addWidget(self.send_button)
-        layout.addLayout(throttle_layout)
-
         self.setLayout(layout)
 
-        # plot config
         self.ax = self.figure.add_subplot(111)
         self.line_raw, = self.ax.plot([], [], 'r-', lw=1.5, label="Raw RPM")
         self.line_filtered, = self.ax.plot([], [], 'b-', lw=2, label="Filtered RPM")
@@ -137,18 +118,6 @@ class RPMPlotter(QWidget):
         self.ax.set_ylabel("RPM")
         self.ax.legend(loc='upper right')
         self.ax.grid(True)
-
-    def send_throttle(self):
-        try:
-            throttle_value = int(self.throttle_input.text())
-            if 0 <= throttle_value <= 2047:
-                data = struct.pack('<H', throttle_value)
-                self.ser.write(data)
-                print(f"Sent throttle: {throttle_value}")
-            else:
-                print("Throttle out of range (0–2047)")
-        except ValueError:
-            print("Invalid throttle input, please enter a number")
 
     def update_plot(self):
         with self.lock:
@@ -175,8 +144,6 @@ class RPMPlotter(QWidget):
 
     def closeEvent(self, event):
         self.serial_thread.running = False
-        if self.ser.is_open:
-            self.ser.close()
         event.accept()
 
 # --- Entry ---

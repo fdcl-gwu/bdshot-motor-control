@@ -58,6 +58,7 @@
 // For BDshot, Bluejay's default is ~2.14 us per bit (for 8kHz DShot).
 #define TELEMETRY_BIT_US 0.95f  // Adjust if needed
 #define TELEMETRY_TIMEOUT_US 50 // Max wait before abort (for loss of signal)
+#define TELEMETRY_BUFFER_SIZE 20
 
 #define POLE_PAIRS 7
 
@@ -114,6 +115,14 @@ static uint32_t dshot_buffer_ch1[DSHOT_BUFFER_SIZE] __attribute__((aligned(4)));
 static uint32_t dshot_buffer_ch2[DSHOT_BUFFER_SIZE] __attribute__((aligned(4))); // DMA buffer for TIM5_CH2
 static uint32_t dshot_buffer_ch3[DSHOT_BUFFER_SIZE] __attribute__((aligned(4))); // DMA buffer for TIM5_CH3
 static uint32_t dshot_buffer_ch4[DSHOT_BUFFER_SIZE] __attribute__((aligned(4))); // DMA buffer for TIM5_CH4
+static uint8_t telemetry_packet_PA0[3];
+static uint8_t telemetry_packet_PA1[3];
+static uint8_t telemetry_packet_PA2[3];
+static uint8_t telemetry_packet_PA3[3];
+static uint32_t telemetry_buffer_ch1[TELEMETRY_BUFFER_SIZE] __attribute__((aligned(4)));
+static uint32_t telemetry_buffer_ch2[TELEMETRY_BUFFER_SIZE] __attribute__((aligned(4)));
+static uint32_t telemetry_buffer_ch3[TELEMETRY_BUFFER_SIZE] __attribute__((aligned(4)));
+static uint32_t telemetry_buffer_ch4[TELEMETRY_BUFFER_SIZE] __attribute__((aligned(4)));
 static volatile bool dshot_running_ch1 = false;       // Flag for CH1 DMA completion
 static volatile bool dshot_running_ch2 = false;       // Flag for CH2 DMA completion
 static volatile bool dshot_running_ch3 = false;       // Flag for CH3 DMA completion
@@ -467,7 +476,7 @@ static inline uint8_t read_telemetry_pin(GPIO_TypeDef *port, uint16_t pin)
     return HAL_GPIO_ReadPin(port, pin) ? 1 : 0;
 }
 
-int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16_t pin) {
+int receive_bdshot_telemetry_bitbang(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16_t pin) {
     uint32_t value = 0;
 
     // Wait for line to go low (start bit)
@@ -494,52 +503,122 @@ int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16
     return 0;
 }
 
-void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_out) {
-	uint32_t telemetry;
-	uint16_t telemetry_16bit;
-	char telemetry_type;
-	float telemetry_value;
-    if (receive_bdshot_telemetry(&telemetry, port, pin) == 0) {
-  	  uint32_t gcr = decode_gcr_mapping(telemetry);
-  	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
-  		  //printf("Invalid GCR encoding.\r\n");
-  		  delay_us_precise(10);
-  	  }
-  	  else {
-            int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
-            if (type == 2) {
-          	  rpm = (uint16_t)(telemetry_value / 7.0);
-          	  uint8_t packet[3];
-          	  packet[0] = 0xAA;                      // Start byte
-          	  packet[1] = rpm & 0xFF;               // LSB
-          	  packet[2] = (rpm >> 8) & 0xFF;        // MSB
-          	  packet_out = packet;
-          	  return;
+int receive_bdshot_telemetry_dma(uint32_t *telemetry_out, TIM_HandleTypeDef *htim, uint32_t channel, uint32_t *dma_buffer) {
+	TIM_IC_InitTypeDef sConfigIC = {0};
+	sConfigIC.ICPolarity  = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
+	sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+	sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+	sConfigIC.ICFilter    = 0;
+	HAL_TIM_IC_ConfigChannel(&htim5, &sConfigIC, channel);
 
-            }
+    *telemetry_out = 0;
+    uint32_t captured_bits = 0;
 
-            else if (type == 1) {
-          	  //printf("EDT\r\n");
-                //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
-            }
-            else if (type == -1){
-                //printf("Invalid Telemetry frame.\r\n");
-            }
-            else if (type == -2){
-          	  //printf("Invalid CRC.\r\n");
-            }
-            else if (type == -3){
-          	  //printf("Something went wrong.\r\n");
-            }
-            else {
-          	  //printf("Unknown Error.\r\n");
-            }
-  	  }
+    // 1. Clear and prepare DMA buffer
+    memset(dma_buffer, 0, sizeof(uint32_t) * TELEMETRY_BUFFER_SIZE);
+
+    // 2. Stop any previous capture
+    HAL_TIM_IC_Stop_DMA(htim, channel);
+
+    // 3. Start DMA capture
+    if (HAL_TIM_IC_Start_DMA(htim, channel, dma_buffer, TELEMETRY_BUFFER_SIZE) != HAL_OK) {
+        return -2; // DMA start error
     }
-    else {
-  	  //printf("Invalid Telemetry.\r\n");
+
+    // 4. Wait for start bit (line goes low) — optional if your ESC immediately responds
+    uint32_t timeout = 0;
+    while (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0)) {  // <-- CHANGE THIS TO MATCH YOUR PORT/PIN
+        delay_us_precise(0.01f);
+        if (++timeout > TELEMETRY_TIMEOUT_US * 25)
+            return -1; // Timeout
+    }
+
+    // 5. Wait for DMA buffer to fill or timeout
+    timeout = 0;
+    while (__HAL_DMA_GET_COUNTER(htim->hdma[channel == TIM_CHANNEL_1 ? TIM_DMA_ID_CC1 :
+                                             channel == TIM_CHANNEL_2 ? TIM_DMA_ID_CC2 :
+                                             channel == TIM_CHANNEL_3 ? TIM_DMA_ID_CC3 :
+                                             TIM_DMA_ID_CC4]) > 0) {
+        delay_us_precise(1);
+        if (++timeout > TELEMETRY_TIMEOUT_US)
+            break;
+    }
+
+    // 6. Stop DMA
+    HAL_TIM_IC_Stop_DMA(htim, channel);
+
+    // 7. Decode edges → bitstream
+    for (int i = 1; i < TELEMETRY_BUFFER_SIZE; i++) {
+        uint32_t dt = dma_buffer[i] - dma_buffer[i - 1];
+        if (dt > 5 && dt < 35) {  // Change thresholds as needed
+            int bit = dt > 20 ? 1 : 0;
+            *telemetry_out |= (bit << (19 - captured_bits));  // LSB-first
+            captured_bits++;
+            if (captured_bits >= 20) break;
+        }
+    }
+
+    return (captured_bits == 20) ? 0 : -3;  // return 0 if 20 bits decoded
+}
+
+void start_telemetry_capture(void) {
+    HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_1);
+    HAL_DMA_DeInit(&hdma_tim5_ch1);
+
+    htim5.Init.Prescaler = 0;
+    htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim5.Init.Period = 0xFFFFFFFF;
+    htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_IC_Init(&htim5) != HAL_OK) {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"IC init failed\r\n", 16, 100);
+        Error_Handler();
+    }
+
+    htim5.Instance->CNT = 0;
+
+    TIM_IC_InitTypeDef sConfigIC = {0};
+    sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
+    sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+    sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+    sConfigIC.ICFilter = 0;
+    if (HAL_TIM_IC_ConfigChannel(&htim5, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"IC config failed\r\n", 18, 100);
+        Error_Handler();
+    }
+
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_tim5_ch1.Instance = DMA1_Stream2;
+    hdma_tim5_ch1.Init.Channel = DMA_CHANNEL_6;
+    hdma_tim5_ch1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim5_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim5_ch1.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim5_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim5_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim5_ch1.Init.Mode = DMA_NORMAL;
+    hdma_tim5_ch1.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim5_ch1.Init.FIFOMode = DMA_FIFOMODE_ENABLE;
+    hdma_tim5_ch1.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_1QUARTERFULL;
+    hdma_tim5_ch1.Init.MemBurst = DMA_MBURST_SINGLE;
+    hdma_tim5_ch1.Init.PeriphBurst = DMA_PBURST_SINGLE;
+    if (HAL_DMA_Init(&hdma_tim5_ch1) != HAL_OK) {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"DMA init failed\r\n", 17, 100);
+        Error_Handler();
+    }
+    __HAL_LINKDMA(&htim5, hdma[TIM_DMA_ID_CC1], hdma_tim5_ch1);
+
+    HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+
+    memset(telemetry_buffer, 0, sizeof(telemetry_buffer));
+
+    if (HAL_TIM_IC_Start_DMA(&htim5, TIM_CHANNEL_1, telemetry_buffer_ch1, TELEMETRY_BUFFER_SIZE) != HAL_OK) {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"IC DMA start failed\r\n", 21, 100);
+        Error_Handler();
     }
 }
+
+
 
 //Telemetry Input
 void set_pin_input(GPIO_TypeDef *port, uint16_t pin)
@@ -561,6 +640,52 @@ void set_pin_pwm(GPIO_TypeDef *port, uint16_t pin, uint8_t alternate)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = alternate;
     HAL_GPIO_Init(port, &GPIO_InitStruct);
+}
+
+void set_pwm_output_mode(void) {
+    HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_1);
+    HAL_TIM_IC_Stop(&htim5, TIM_CHANNEL_1);
+    HAL_DMA_DeInit(&hdma_tim5_ch1);
+
+    htim5.Init.Prescaler = 0;
+    htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim5.Init.Period = DSHOT_BIT_PERIOD_TICKS - 1; // 139 for 1.67 µs
+    htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&htim5) != HAL_OK) {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"PWM init failed\r\n", 17, 100);
+        Error_Handler();
+    }
+
+    TIM_OC_InitTypeDef sConfigOC = {0};
+    sConfigOC.OCMode = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse = 0;
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_LOW;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"PWM config failed\r\n", 19, 100);
+        Error_Handler();
+    }
+
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_tim5_ch1.Instance = DMA1_Stream2;
+    hdma_tim5_ch1.Init.Channel = DMA_CHANNEL_6;
+    hdma_tim5_ch1.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_tim5_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim5_ch1.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim5_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim5_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim5_ch1.Init.Mode = DMA_NORMAL;
+    hdma_tim5_ch1.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim5_ch1.Init.FIFOMode = DMA_FIFOMODE_ENABLE;
+    hdma_tim5_ch1.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_1QUARTERFULL;
+    hdma_tim5_ch1.Init.MemBurst = DMA_MBURST_SINGLE;
+    hdma_tim5_ch1.Init.PeriphBurst = DMA_PBURST_SINGLE;
+    if (HAL_DMA_Init(&hdma_tim5_ch1) != HAL_OK) {
+        HAL_UART_Transmit(&huart6, (uint8_t*)"DMA init failed\r\n", 17, 100);
+        Error_Handler();
+    }
+    __HAL_LINKDMA(&htim5, hdma[TIM_DMA_ID_CC1], hdma_tim5_ch1);
 }
 
 void prepare_bdshot_buffer(uint16_t frame, uint32_t *dshot_buffer)
@@ -904,27 +1029,66 @@ void DShotTask(void *argument)
       send_bdshot(TIM_CHANNEL_2);
       send_bdshot(TIM_CHANNEL_3);
       send_bdshot(TIM_CHANNEL_4);
+
       delay_us_precise(40);
 
-      set_pin_input(GPIOA, GPIO_PIN_0);
-      set_pin_input(GPIOA, GPIO_PIN_1);
-      set_pin_input(GPIOA, GPIO_PIN_2);
-      set_pin_input(GPIOA, GPIO_PIN_3);
+      //set_pin_input(GPIOA, GPIO_PIN_0);
+      //set_pin_input(GPIOA, GPIO_PIN_1);
+      //set_pin_input(GPIOA, GPIO_PIN_2);
+      //set_pin_input(GPIOA, GPIO_PIN_3);
+      start_telemetry_capture();
 
-      uint8_t packet_PA0[3];
-      uint8_t packet_PA1[3];
-      uint8_t packet_PA2[3];
-      uint8_t packet_PA3[3];
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_0, packet_PA0);
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_1, packet_PA1);
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_2, packet_PA2);
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_3, packet_PA3);
-	  //send_binary_uart6(packet, sizeof(packet));
 
-      set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
-      set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
-      set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
-      set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
+      uint32_t telemetry;
+      uint16_t telemetry_16bit;
+      char telemetry_type;
+      float telemetry_value;
+      /*
+      if (receive_bdshot_telemetry_dma(&telemetry, &htim5, TIM_CHANNEL_1, telemetry_buffer_ch1) == 0) {
+    	  uint32_t gcr = decode_gcr_mapping(telemetry);
+    	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
+    		  //printf("Invalid GCR encoding.\r\n");
+    		  delay_us_precise(10);
+    	  }
+    	  else {
+              int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
+              if (type == 2) {
+            	  rpm = (uint16_t)(telemetry_value / 7.0);
+            	  uint8_t packet[3];
+            	  packet[0] = 0xAA;                      // Start byte
+            	  packet[1] = rpm & 0xFF;               // LSB
+            	  packet[2] = (rpm >> 8) & 0xFF;        // MSB
+            	  send_binary_uart6(packet, sizeof(packet));
+              }
+
+              else if (type == 1) {
+            	  //printf("EDT\r\n");
+                  //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
+              }
+              else if (type == -1){
+                  //printf("Invalid Telemetry frame.\r\n");
+              }
+              else if (type == -2){
+            	  //printf("Invalid CRC.\r\n");
+              }
+              else if (type == -3){
+            	  //printf("Something went wrong.\r\n");
+              }
+              else {
+            	  //printf("Unknown Error.\r\n");
+              }
+    	  }
+      }
+      else {
+    	  //printf("Invalid Telemetry.\r\n");
+      }
+      */
+
+      //set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
+      //set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
+      //set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
+      //set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
+      set_pwm_output_mode();
       vTaskDelay(1);
     }
     while (1)
@@ -944,10 +1108,18 @@ void DShotTask(void *argument)
 void StartSerialTask(void *argument)
 {
   /* USER CODE BEGIN StartSerialTask */
-  /* Infinite loop */
-  for(;;)
+    SerialMessage_t msg;
+
+  for (;;)
   {
-    osDelay(1);
+      // 1️⃣ Process serial debug messages
+      if (osMessageQueueGet(serialQueueHandle, &msg, NULL, osWaitForever) == osOK) {
+          HAL_UART_Transmit(&huart6, msg.data, msg.length, HAL_MAX_DELAY);
+      }
+      //HAL_UART_Transmit(&huart6, (uint8_t *)"SerialTask alive\r\n", 18, HAL_MAX_DELAY);
+      //osDelay(1000);  // Only for debugging; remove later
+
+      osDelay(1); // Let other tasks run
   }
   /* USER CODE END StartSerialTask */
 }
