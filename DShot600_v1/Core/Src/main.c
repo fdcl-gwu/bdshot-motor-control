@@ -561,63 +561,103 @@ int receive_bdshot_telemetry_dma(uint32_t *telemetry_out, TIM_HandleTypeDef *hti
     return (captured_bits == 20) ? 0 : -3;  // return 0 if 20 bits decoded
 }
 
-void start_telemetry_capture(void) {
-    HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_1);
-    HAL_DMA_DeInit(&hdma_tim5_ch1);
+void start_telemetry_capture(
+    TIM_HandleTypeDef *htim,
+    DMA_HandleTypeDef *hdma,
+    DMA_Stream_TypeDef *dma_stream,
+    uint32_t dma_channel,
+    uint32_t channel,
+    uint32_t *telemetry_buffer,
+    uint32_t telemetry_buffer_size
+) {
+    // 1. Stop PWM & reset DMA
+    HAL_TIM_PWM_Stop(htim, channel);
+    HAL_DMA_DeInit(hdma);
 
-    htim5.Init.Prescaler = 0;
-    htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim5.Init.Period = 0xFFFFFFFF;
-    htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_IC_Init(&htim5) != HAL_OK) {
+    // 2. Configure timer for input capture
+    htim->Init.Prescaler = 0;
+    htim->Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim->Init.Period = 0xFFFFFFFF;
+    htim->Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim->Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_IC_Init(htim) != HAL_OK) {
         HAL_UART_Transmit(&huart6, (uint8_t*)"IC init failed\r\n", 16, 100);
         Error_Handler();
     }
 
-    htim5.Instance->CNT = 0;
+    htim->Instance->CNT = 0;
 
+    // 3. Configure input capture on selected channel
     TIM_IC_InitTypeDef sConfigIC = {0};
     sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
     sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
     sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
     sConfigIC.ICFilter = 0;
-    if (HAL_TIM_IC_ConfigChannel(&htim5, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) {
+    if (HAL_TIM_IC_ConfigChannel(htim, &sConfigIC, channel) != HAL_OK) {
         HAL_UART_Transmit(&huart6, (uint8_t*)"IC config failed\r\n", 18, 100);
         Error_Handler();
     }
 
-    __HAL_RCC_DMA1_CLK_ENABLE();
-    hdma_tim5_ch1.Instance = DMA1_Stream2;
-    hdma_tim5_ch1.Init.Channel = DMA_CHANNEL_6;
-    hdma_tim5_ch1.Init.Direction = DMA_PERIPH_TO_MEMORY;
-    hdma_tim5_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
-    hdma_tim5_ch1.Init.MemInc = DMA_MINC_ENABLE;
-    hdma_tim5_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
-    hdma_tim5_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
-    hdma_tim5_ch1.Init.Mode = DMA_NORMAL;
-    hdma_tim5_ch1.Init.Priority = DMA_PRIORITY_HIGH;
-    hdma_tim5_ch1.Init.FIFOMode = DMA_FIFOMODE_ENABLE;
-    hdma_tim5_ch1.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_1QUARTERFULL;
-    hdma_tim5_ch1.Init.MemBurst = DMA_MBURST_SINGLE;
-    hdma_tim5_ch1.Init.PeriphBurst = DMA_PBURST_SINGLE;
-    if (HAL_DMA_Init(&hdma_tim5_ch1) != HAL_OK) {
+    // 4. Configure DMA
+    __HAL_RCC_DMA1_CLK_ENABLE(); // Change if using DMA2
+
+    hdma->Instance = dma_stream;
+    hdma->Init.Channel = dma_channel;
+    hdma->Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma->Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma->Init.MemInc = DMA_MINC_ENABLE;
+    hdma->Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma->Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma->Init.Mode = DMA_NORMAL;
+    hdma->Init.Priority = DMA_PRIORITY_HIGH;
+    hdma->Init.FIFOMode = DMA_FIFOMODE_ENABLE;
+    hdma->Init.FIFOThreshold = DMA_FIFO_THRESHOLD_1QUARTERFULL;
+    hdma->Init.MemBurst = DMA_MBURST_SINGLE;
+    hdma->Init.PeriphBurst = DMA_PBURST_SINGLE;
+    if (HAL_DMA_Init(hdma) != HAL_OK) {
         HAL_UART_Transmit(&huart6, (uint8_t*)"DMA init failed\r\n", 17, 100);
         Error_Handler();
     }
-    __HAL_LINKDMA(&htim5, hdma[TIM_DMA_ID_CC1], hdma_tim5_ch1);
 
-    HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+    // 5. Link DMA to timer channel
+    switch (channel) {
+        case TIM_CHANNEL_1:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC1], *hdma); break;
+        case TIM_CHANNEL_2:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC2], *hdma); break;
+        case TIM_CHANNEL_3:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC3], *hdma); break;
+        case TIM_CHANNEL_4:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC4], *hdma); break;
+        default:
+            HAL_UART_Transmit(&huart6, (uint8_t*)"Invalid channel\r\n", 17, 100);
+            Error_Handler();
+    }
 
-    memset(telemetry_buffer, 0, sizeof(telemetry_buffer));
+    // 6. Enable IRQ (optional based on DMA config)
+    // You can move this outside if shared across multiple DMA streams
+    if (dma_stream == DMA1_Stream0) {
+        HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
+        HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+    } else if (dma_stream == DMA1_Stream1) {
+        HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
+        HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+    } else if (dma_stream == DMA1_Stream2) {
+        HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 5, 0);
+        HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+    } else if (dma_stream == DMA1_Stream3) {
+        HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 5, 0);
+        HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
+    }
 
-    if (HAL_TIM_IC_Start_DMA(&htim5, TIM_CHANNEL_1, telemetry_buffer_ch1, TELEMETRY_BUFFER_SIZE) != HAL_OK) {
+    // 7. Clear buffer and start DMA capture
+    memset(telemetry_buffer, 0, telemetry_buffer_size * sizeof(uint32_t));
+
+    if (HAL_TIM_IC_Start_DMA(htim, channel, telemetry_buffer, telemetry_buffer_size) != HAL_OK) {
         HAL_UART_Transmit(&huart6, (uint8_t*)"IC DMA start failed\r\n", 21, 100);
         Error_Handler();
     }
 }
-
 
 
 //Telemetry Input
@@ -642,51 +682,74 @@ void set_pin_pwm(GPIO_TypeDef *port, uint16_t pin, uint8_t alternate)
     HAL_GPIO_Init(port, &GPIO_InitStruct);
 }
 
-void set_pwm_output_mode(void) {
-    HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_1);
-    HAL_TIM_IC_Stop(&htim5, TIM_CHANNEL_1);
-    HAL_DMA_DeInit(&hdma_tim5_ch1);
+void set_pwm_output_mode(TIM_HandleTypeDef *htim, uint32_t channel, DMA_HandleTypeDef *hdma, DMA_Stream_TypeDef *dma_stream, uint32_t dma_channel) {
+    // Stop existing functions
+    HAL_TIM_PWM_Stop(htim, channel);
+    HAL_TIM_IC_Stop(htim, channel);
+    HAL_DMA_DeInit(hdma);
 
-    htim5.Init.Prescaler = 0;
-    htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim5.Init.Period = DSHOT_BIT_PERIOD_TICKS - 1; // 139 for 1.67 µs
-    htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_PWM_Init(&htim5) != HAL_OK) {
+    // Timer base config
+    htim->Init.Prescaler = 0;
+    htim->Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim->Init.Period = DSHOT_BIT_PERIOD_TICKS - 1;  // e.g., 139 for 1.67 µs
+    htim->Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim->Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(htim) != HAL_OK) {
         HAL_UART_Transmit(&huart6, (uint8_t*)"PWM init failed\r\n", 17, 100);
         Error_Handler();
     }
 
+    // PWM output config
     TIM_OC_InitTypeDef sConfigOC = {0};
     sConfigOC.OCMode = TIM_OCMODE_PWM1;
     sConfigOC.Pulse = 0;
     sConfigOC.OCPolarity = TIM_OCPOLARITY_LOW;
     sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-    if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) {
+    if (HAL_TIM_PWM_ConfigChannel(htim, &sConfigOC, channel) != HAL_OK) {
         HAL_UART_Transmit(&huart6, (uint8_t*)"PWM config failed\r\n", 19, 100);
         Error_Handler();
     }
 
-    __HAL_RCC_DMA1_CLK_ENABLE();
-    hdma_tim5_ch1.Instance = DMA1_Stream2;
-    hdma_tim5_ch1.Init.Channel = DMA_CHANNEL_6;
-    hdma_tim5_ch1.Init.Direction = DMA_MEMORY_TO_PERIPH;
-    hdma_tim5_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
-    hdma_tim5_ch1.Init.MemInc = DMA_MINC_ENABLE;
-    hdma_tim5_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
-    hdma_tim5_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
-    hdma_tim5_ch1.Init.Mode = DMA_NORMAL;
-    hdma_tim5_ch1.Init.Priority = DMA_PRIORITY_HIGH;
-    hdma_tim5_ch1.Init.FIFOMode = DMA_FIFOMODE_ENABLE;
-    hdma_tim5_ch1.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_1QUARTERFULL;
-    hdma_tim5_ch1.Init.MemBurst = DMA_MBURST_SINGLE;
-    hdma_tim5_ch1.Init.PeriphBurst = DMA_PBURST_SINGLE;
-    if (HAL_DMA_Init(&hdma_tim5_ch1) != HAL_OK) {
+    // DMA config
+    __HAL_RCC_DMA1_CLK_ENABLE();  // Modify if using DMA2
+
+    hdma->Instance = dma_stream;
+    hdma->Init.Channel = dma_channel;
+    hdma->Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma->Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma->Init.MemInc = DMA_MINC_ENABLE;
+    hdma->Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma->Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma->Init.Mode = DMA_NORMAL;
+    hdma->Init.Priority = DMA_PRIORITY_HIGH;
+    hdma->Init.FIFOMode = DMA_FIFOMODE_ENABLE;
+    hdma->Init.FIFOThreshold = DMA_FIFO_THRESHOLD_1QUARTERFULL;
+    hdma->Init.MemBurst = DMA_MBURST_SINGLE;
+    hdma->Init.PeriphBurst = DMA_PBURST_SINGLE;
+    if (HAL_DMA_Init(hdma) != HAL_OK) {
         HAL_UART_Transmit(&huart6, (uint8_t*)"DMA init failed\r\n", 17, 100);
         Error_Handler();
     }
-    __HAL_LINKDMA(&htim5, hdma[TIM_DMA_ID_CC1], hdma_tim5_ch1);
+
+    // Link DMA to the correct timer channel
+    switch (channel) {
+        case TIM_CHANNEL_1:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC1], *hdma);
+            break;
+        case TIM_CHANNEL_2:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC2], *hdma);
+            break;
+        case TIM_CHANNEL_3:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC3], *hdma);
+            break;
+        case TIM_CHANNEL_4:
+            __HAL_LINKDMA(htim, hdma[TIM_DMA_ID_CC4], *hdma);
+            break;
+        default:
+            Error_Handler();  // Unsupported channel
+    }
 }
+
 
 void prepare_bdshot_buffer(uint16_t frame, uint32_t *dshot_buffer)
 {
@@ -1036,14 +1099,22 @@ void DShotTask(void *argument)
       //set_pin_input(GPIOA, GPIO_PIN_1);
       //set_pin_input(GPIOA, GPIO_PIN_2);
       //set_pin_input(GPIOA, GPIO_PIN_3);
-      start_telemetry_capture();
+
+      start_telemetry_capture(
+          &htim5,
+          &hdma_tim5_ch1,
+          DMA1_Stream2,
+          DMA_CHANNEL_6,
+          TIM_CHANNEL_1,
+          telemetry_buffer_ch1,
+          TELEMETRY_BUFFER_SIZE
+      );
 
 
       uint32_t telemetry;
       uint16_t telemetry_16bit;
       char telemetry_type;
       float telemetry_value;
-      /*
       if (receive_bdshot_telemetry_dma(&telemetry, &htim5, TIM_CHANNEL_1, telemetry_buffer_ch1) == 0) {
     	  uint32_t gcr = decode_gcr_mapping(telemetry);
     	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
@@ -1082,13 +1153,15 @@ void DShotTask(void *argument)
       else {
     	  //printf("Invalid Telemetry.\r\n");
       }
-      */
 
       //set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
       //set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
       //set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
       //set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
-      set_pwm_output_mode();
+      set_pwm_output_mode(&htim5, TIM_CHANNEL_1, &hdma_tim5_ch1, DMA1_Stream2, DMA_CHANNEL_6);
+      //set_pwm_output_mode(&htim5, TIM_CHANNEL_2, &hdma_tim5_ch2, DMA1_Stream3, DMA_CHANNEL_6);
+      //set_pwm_output_mode(&htim5, TIM_CHANNEL_3, &hdma_tim5_ch3_up, DMA1_Stream0, DMA_CHANNEL_6);
+      //set_pwm_output_mode(&htim5, TIM_CHANNEL_4, &hdma_tim5_ch4_trig, DMA1_Stream1, DMA_CHANNEL_6);
       vTaskDelay(1);
     }
     while (1)
