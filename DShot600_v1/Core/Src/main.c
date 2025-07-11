@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -56,7 +55,7 @@
 
 // This timing must match the ESC's telemetry bit width.
 // For BDshot, Bluejay's default is ~2.14 us per bit (for 8kHz DShot).
-#define TELEMETRY_BIT_US 0.95f  // Adjust if needed
+#define TELEMETRY_BIT_US 1.13f  // Adjust if needed
 #define TELEMETRY_TIMEOUT_US 50 // Max wait before abort (for loss of signal)
 
 #define POLE_PAIRS 7
@@ -67,9 +66,6 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-uint16_t rpm = -1;
-
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -81,27 +77,6 @@ DMA_HandleTypeDef hdma_tim5_ch4_trig;
 
 UART_HandleTypeDef huart6;
 
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-/* Definitions for DShotTask_1 */
-osThreadId_t DShotTask_1Handle;
-const osThreadAttr_t DShotTask_1_attributes = {
-  .name = "DShotTask_1",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
-};
-/* Definitions for SerialTask */
-osThreadId_t SerialTaskHandle;
-const osThreadAttr_t SerialTask_attributes = {
-  .name = "SerialTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
-};
 /* USER CODE BEGIN PV */
 uint8_t telemetry_buffer[2]; // Make sure it's global!
 
@@ -118,11 +93,6 @@ static volatile bool dshot_running_ch1 = false;       // Flag for CH1 DMA comple
 static volatile bool dshot_running_ch2 = false;       // Flag for CH2 DMA completion
 static volatile bool dshot_running_ch3 = false;       // Flag for CH3 DMA completion
 static volatile bool dshot_running_ch4 = false;       // Flag for CH4 DMA completion
-static uint8_t packet_PA0[3];
-static uint8_t packet_PA1[3];
-static uint8_t packet_PA2[3];
-static uint8_t packet_PA3[3];
-osMessageQueueId_t serialQueueHandle;
 
 
 /* USER CODE END PV */
@@ -133,26 +103,22 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_USART6_UART_Init(void);
-void StartDefaultTask(void *argument);
-void DShotTask(void *argument);
-void StartSerialTask(void *argument);
-
 /* USER CODE BEGIN PFP */
 void prepare_bdshot_buffer(uint16_t frame, uint32_t *dshot_buffer);
 uint16_t make_bdshot_frame(uint16_t value, bool telemetry);
 void queue_bdshot_pulse(uint16_t throttle, bool telemetry, uint32_t *dshot_buffer);
 void send_bdshot(uint32_t channel);
-void vTaskDelay( const TickType_t xTicksToDelay );
 void delay_task_us(uint32_t us);
 void DWT_Init(void);
-void delay_us_precise(float us);
+void delay_us_precise(double us);
 uint32_t decode_gcr_mapping(uint32_t value);
 int decode_gcr_20_to_16(uint32_t input_20bit, uint16_t *out_value);
 int parse_edt_frame(uint16_t frame, char *type_out, float *value_out);
-int send_binary_uart6(const void* data, size_t len);
+void set_pin_input(GPIO_TypeDef *port, uint16_t pin);
+void set_pin_pwm(GPIO_TypeDef *port, uint16_t pin, uint8_t alternate);
+void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_out);
+void delay_ns(uint32_t ns);
 
-
-//uint32_t us_to_ticks(uint32_t us); Problematic because in FreeRTOS with a 1 Khz cycle, 1 tick is 1 ms
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -194,50 +160,75 @@ int main(void)
   MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Create the thread(s) */
+  printf("\nDShotTask Begin.\r\n");
+  printf("SystemCoreClock=%lu\r\n", SystemCoreClock);
+  uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+  uint32_t tim5_clk = pclk1;
+  if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1)
+      tim5_clk *= 2;
+  printf("TIM5 actual clk: %lu\r\n", tim5_clk);
+
+  queue_bdshot_pulse(0, true, dshot_buffer_ch1);
+  queue_bdshot_pulse(0, true, dshot_buffer_ch2);
+  queue_bdshot_pulse(0, true, dshot_buffer_ch3);
+  queue_bdshot_pulse(0, true, dshot_buffer_ch4);
+  for (int i = 0; i < 3000; i++){
+  	send_bdshot(TIM_CHANNEL_1);
+  	send_bdshot(TIM_CHANNEL_2);
+  	send_bdshot(TIM_CHANNEL_3);
+  	send_bdshot(TIM_CHANNEL_4);
+  	delay_us_precise(1000);
+  	}
+  	delay_us_precise(50000);
+
+  	queue_bdshot_pulse(100, true, dshot_buffer_ch1);
+  	queue_bdshot_pulse(200, true, dshot_buffer_ch2);
+  	queue_bdshot_pulse(300, true, dshot_buffer_ch3);
+  	queue_bdshot_pulse(400, true, dshot_buffer_ch4);
+  	uint8_t packet_PA0[3];
+  	uint8_t packet_PA1[3];
+  	uint8_t packet_PA2[3];
+  	uint8_t packet_PA3[3];
+      for (;;){
+        while(dshot_running_ch1){delay_us_precise(5);}
+        send_bdshot(TIM_CHANNEL_1);
+        delay_us_precise(40);
+        set_pin_input(GPIOA, GPIO_PIN_0);
+        process_bdshot_telemetry(GPIOA, GPIO_PIN_0, packet_PA0);
+        set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
+        delay_us_precise(60);
+
+        while(dshot_running_ch2){delay_us_precise(5);}
+        send_bdshot(TIM_CHANNEL_2);
+        delay_us_precise(40);
+        set_pin_input(GPIOA, GPIO_PIN_1);
+        //process_bdshot_telemetry(GPIOA, GPIO_PIN_1, packet_PA1);
+        set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
+        delay_us_precise(60);
+
+        while(dshot_running_ch3){delay_us_precise(5);}
+        send_bdshot(TIM_CHANNEL_3);
+        delay_us_precise(40);
+        set_pin_input(GPIOA, GPIO_PIN_2);
+        //process_bdshot_telemetry(GPIOA, GPIO_PIN_2, packet_PA2);
+        set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
+        delay_us_precise(60);
+
+        while(dshot_running_ch4){delay_us_precise(5);}
+        send_bdshot(TIM_CHANNEL_4);
+        delay_us_precise(40);
+        set_pin_input(GPIOA, GPIO_PIN_3);
+        //process_bdshot_telemetry(GPIOA, GPIO_PIN_3, packet_PA3);
+        set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
+        delay_us_precise(60);
+
+        //HAL_UART_Transmit(&huart6, packet_PA0, 3, HAL_MAX_DELAY);
+        //HAL_UART_Transmit(&huart6, packet_PA1, 3, HAL_MAX_DELAY);
+        //HAL_UART_Transmit(&huart6, packet_PA2, 3, HAL_MAX_DELAY);
+        //HAL_UART_Transmit(&huart6, packet_PA3, 3, HAL_MAX_DELAY);
+      }
   /* USER CODE END 2 */
 
-  /* Init scheduler */
-  osKernelInitialize();
-
-  /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-  /* USER CODE END RTOS_MUTEX */
-
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
-  /* USER CODE END RTOS_SEMAPHORES */
-
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
-  /* USER CODE END RTOS_TIMERS */
-
-  /* USER CODE BEGIN RTOS_QUEUES */
-  serialQueueHandle = osMessageQueueNew(SERIAL_QUEUE_LENGTH, sizeof(SerialMessage_t), NULL);  /* add queues, ... */
-  /* USER CODE END RTOS_QUEUES */
-
-  /* Create the thread(s) */
-  /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
-
-  /* creation of DShotTask_1 */
-  DShotTask_1Handle = osThreadNew(DShotTask, NULL, &DShotTask_1_attributes);
-
-  /* creation of SerialTask */
-  SerialTaskHandle = osThreadNew(StartSerialTask, NULL, &SerialTask_attributes);
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  /* USER CODE END RTOS_THREADS */
-
-  /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
-  /* USER CODE END RTOS_EVENTS */
-
-  /* Start scheduler */
-  osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
@@ -399,16 +390,16 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
   /* DMA1_Stream1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA1_Stream2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
   /* DMA1_Stream4_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
 
 }
@@ -420,6 +411,7 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -427,7 +419,18 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PB10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* USER CODE END MX_GPIO_Init_2 */
@@ -465,6 +468,7 @@ void uart_print_int(UART_HandleTypeDef *huart, int value) {
     HAL_UART_Transmit(huart, (uint8_t *)buf, idx, HAL_MAX_DELAY);
 }
 
+
 static inline uint8_t read_telemetry_pin(GPIO_TypeDef *port, uint16_t pin)
 {
     return HAL_GPIO_ReadPin(port, pin) ? 1 : 0;
@@ -476,21 +480,19 @@ int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16
     // Wait for line to go low (start bit)
     uint32_t timeout = 0;
     while (read_telemetry_pin(port, pin)) {
-        delay_us_precise(0.01f);
-        if (++timeout > TELEMETRY_TIMEOUT_US * 25)
+        delay_us_precise(1);
+        if (++timeout > TELEMETRY_TIMEOUT_US)
             return -1; // Timeout
     }
 
-    // Wait half a bit to center
-    //delay_us_precise(TELEMETRY_BIT_US/2.0f);
-    delay_us_precise(0.1f);
+    delay_ns(500);
 
     // LSB-first: capture 20 bits
     for (int i = 0; i < 20; i++) {
-    	//HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+    	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
         value |= (read_telemetry_pin(port, pin) << (19-i)); // LSB-first
-        delay_us_precise(TELEMETRY_BIT_US);
-        //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+        //delay_ns(100);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
     }
 
     *telemetry_out = value;
@@ -505,49 +507,48 @@ void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_
     if (receive_bdshot_telemetry(&telemetry, port, pin) == 0) {
   	  uint32_t gcr = decode_gcr_mapping(telemetry);
   	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
-  		  //printf("Invalid GCR encoding.\r\n");
+  		  printf("Invalid GCR encoding.\r\n");
   		  delay_us_precise(10);
   	  }
   	  else {
             int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
             if (type == 2) {
-          	  rpm = (uint16_t)(telemetry_value / 7.0);
-          	  uint8_t packet[3];
-          	  packet[0] = 0xAA;                      // Start byte
-          	  packet[1] = rpm & 0xFF;               // LSB
-          	  packet[2] = (rpm >> 8) & 0xFF;        // MSB
-          	  //char debug[32];
-          	  //sprintf(debug, "RPM0: %u\r\n", rpm);
-          	  //HAL_UART_Transmit(&huart6, (uint8_t*)debug, strlen(debug), HAL_MAX_DELAY);
-          	  packet_out = packet;
-          	  return;
-
+          	  uint16_t rpm = (uint16_t)(telemetry_value / 7.0);
+          	  packet_out[0] = 0xAA;                      // Start byte
+          	  packet_out[1] = rpm & 0xFF;               // LSB
+          	  packet_out[2] = (rpm >> 8) & 0xFF;        // MSB
+          	  printf("PA0 RPM: %d\r\n", rpm);
             }
 
             else if (type == 1) {
-          	  //printf("EDT\r\n");
+            	printf("EDT\r\n");
                 //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
             }
             else if (type == -1){
-                //printf("Invalid Telemetry frame.\r\n");
+                printf("Invalid Telemetry frame.\r\n");
             }
             else if (type == -2){
-          	  //printf("Invalid CRC.\r\n");
+            	printf("Invalid CRC.\r\n");
             }
             else if (type == -3){
-          	  //printf("Something went wrong.\r\n");
+            	printf("Something went wrong.\r\n");
             }
             else {
-          	  //printf("Unknown Error.\r\n");
+            	printf("Unknown Error.\r\n");
             }
   	  }
     }
     else {
-  	  //printf("Invalid Telemetry.\r\n");
+    	printf("Invalid Telemetry.\r\n");
     }
 }
 
-
+//One cycle is ~6 ns. This is lower limit of function
+void delay_ns(uint32_t ns) {
+    uint32_t cycles = (SystemCoreClock / 1e9f) * ns;
+    uint32_t start = DWT->CYCCNT;
+    while ((DWT->CYCCNT - start) < cycles);
+}
 //Telemetry Input
 void set_pin_input(GPIO_TypeDef *port, uint16_t pin)
 {
@@ -655,28 +656,12 @@ void send_bdshot(uint32_t channel){
 }
 
 
-void delay_us_precise(float us) {
+void delay_us_precise(double us) {
     uint32_t cycles = (uint32_t)(SystemCoreClock * us / 1e6f);
     uint32_t start = DWT->CYCCNT;
     while ((DWT->CYCCNT - start) < cycles);
 }
 
-int _write(int file, char *ptr, int len)
-{
-    // For safety, truncate messages to queue item size
-    if (len > SERIAL_QUEUE_ITEM_SIZE - 1) len = SERIAL_QUEUE_ITEM_SIZE - 1;
-
-    char msg[SERIAL_QUEUE_ITEM_SIZE];
-    memcpy(msg, ptr, len);
-    msg[len] = '\0'; // Null-terminate
-
-    // Send to queue (in ISR context: use osMessageQueuePutFromISR, but here normal context)
-    if (osMessageQueuePut(serialQueueHandle, msg, 0, 0) != osOK) {
-        // Handle queue full if needed
-    }
-
-    return len;
-}
 
 void DWT_Init(void) {
     if (!(DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk)) {
@@ -834,145 +819,13 @@ int parse_edt_frame(uint16_t frame, char *type_out, float *value_out) {
     return -3;
 }
 
-int send_binary_uart6(const void* data, size_t len)
+int _write(int file, char *ptr, int len)
 {
-    if (len > SERIAL_QUEUE_ITEM_SIZE)
-        len = SERIAL_QUEUE_ITEM_SIZE;
-
-    SerialMessage_t msg;
-    memcpy(msg.data, data, len);
-    msg.length = len;
-
-    if (osMessageQueuePut(serialQueueHandle, &msg, 0, 0) != osOK) {
-        return 0;
-    }
-
+    HAL_UART_Transmit(&huart6, (uint8_t*)ptr, len, HAL_MAX_DELAY);
     return len;
 }
 
 /* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
-{
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END 5 */
-}
-
-/* USER CODE BEGIN Header_DShotTask */
-/**
-* @brief Function implementing the DShotTask_1 thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_DShotTask */
-void DShotTask(void *argument)
-{
-  /* USER CODE BEGIN DShotTask */
-	printf("\nDShotTask Begin.\r\n");
-	printf("SystemCoreClock=%lu\r\n", SystemCoreClock);
-	uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
-	uint32_t tim5_clk = pclk1;
-	if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1)
-	    tim5_clk *= 2;
-	printf("TIM5 actual clk: %lu\r\n", tim5_clk);
-
-	queue_bdshot_pulse(0, true, dshot_buffer_ch1);
-	queue_bdshot_pulse(0, true, dshot_buffer_ch2);
-	queue_bdshot_pulse(0, true, dshot_buffer_ch3);
-	queue_bdshot_pulse(0, true, dshot_buffer_ch4);
-	for (int i = 0; i < 3000; i++){
-		send_bdshot(TIM_CHANNEL_1);
-		send_bdshot(TIM_CHANNEL_2);
-	    send_bdshot(TIM_CHANNEL_3);
-	    send_bdshot(TIM_CHANNEL_4);
-		vTaskDelay(1);
-	}
-	vTaskDelay(50);
-
-	queue_bdshot_pulse(100, true, dshot_buffer_ch1);
-	queue_bdshot_pulse(200, true, dshot_buffer_ch2);
-	queue_bdshot_pulse(300, true, dshot_buffer_ch3);
-	queue_bdshot_pulse(400, true, dshot_buffer_ch4);
-    for (;;){
-      while(dshot_running_ch1){delay_us_precise(5);}
-      send_bdshot(TIM_CHANNEL_1);
-      delay_us_precise(40);
-      set_pin_input(GPIOA, GPIO_PIN_0);
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_0, packet_PA0);
-      set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
-      delay_us_precise(60);
-
-      while(dshot_running_ch2){delay_us_precise(5);}
-      send_bdshot(TIM_CHANNEL_2);
-      delay_us_precise(40);
-      set_pin_input(GPIOA, GPIO_PIN_1);
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_1, packet_PA1);
-      set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
-      delay_us_precise(60);
-
-      while(dshot_running_ch3){delay_us_precise(5);}
-      send_bdshot(TIM_CHANNEL_3);
-      delay_us_precise(40);
-      set_pin_input(GPIOA, GPIO_PIN_2);
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_2, packet_PA2);
-      set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
-      delay_us_precise(60);
-
-      while(dshot_running_ch4){delay_us_precise(5);}
-      send_bdshot(TIM_CHANNEL_4);
-      set_pin_input(GPIOA, GPIO_PIN_3);
-      process_bdshot_telemetry(GPIOA, GPIO_PIN_3, packet_PA3);
-      set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
-      delay_us_precise(60);
-
-	  send_binary_uart6(packet_PA0, sizeof(packet_PA0));
-
-      vTaskDelay(1);
-    }
-    while (1)
-    {
-
-    }
-  /* USER CODE END DShotTask */
-}
-
-/* USER CODE BEGIN Header_StartSerialTask */
-/**
-* @brief Function implementing the SerialTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartSerialTask */
-void StartSerialTask(void *argument)
-{
-  /* USER CODE BEGIN StartSerialTask */
-    SerialMessage_t msg;
-
-  for (;;)
-  {
-      // 1️⃣ Process serial debug messages
-      if (osMessageQueueGet(serialQueueHandle, &msg, NULL, osWaitForever) == osOK) {
-          HAL_UART_Transmit(&huart6, msg.data, msg.length, HAL_MAX_DELAY);
-      }
-      //HAL_UART_Transmit(&huart6, (uint8_t *)"SerialTask alive\r\n", 18, HAL_MAX_DELAY);
-      //osDelay(1000);  // Only for debugging; remove later
-
-      osDelay(1); // Let other tasks run
-  }
-  /* USER CODE END StartSerialTask */
-}
 
 /**
   * @brief  Period elapsed callback in non blocking mode
