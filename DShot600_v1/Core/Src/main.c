@@ -41,7 +41,7 @@
 #define DSHOT_BIT_PERIOD_TICKS 140  // 1.67 µs at 84 MHz (TIM5 clock)
 #define DSHOT_T1L_TICKS 105         // Logic 1: LOW for 1.130 µs (inverted)
 #define DSHOT_T0L_TICKS 50         // Logic 0: LOW for 0.600 µs (inverted)
-#define DSHOT_BUFFER_SIZE 20 // 1 LOW + 16 bits + 1 LOW
+#define DSHOT_BUFFER_SIZE 21 // 5 LOW + 16 bits + 1 LOW
 #define DSHOT_TIME_GAP_US 500 //Gap between frames (adjustable)
 #define DSHOT_FRAME_TIME_US (DSHOT_BIT_PERIOD_US * (16 + 2)) //26.72 us + 3.34 us = 30.06 us
 #define DSHOT_TOTAL_PERIOD_US (DSHOT_FRAME_TIME_US + DSHOT_TIME_GAP_US)
@@ -57,6 +57,7 @@
 // For BDshot, Bluejay's default is ~2.14 us per bit (for 8kHz DShot).
 #define TELEMETRY_BIT_US 1.13f  // Adjust if needed
 #define TELEMETRY_TIMEOUT_US 50 // Max wait before abort (for loss of signal)
+#define TELEMETRY_TIMEOUT_SPINS 500
 
 #define POLE_PAIRS 7
 
@@ -117,6 +118,7 @@ int parse_edt_frame(uint16_t frame, char *type_out, float *value_out);
 void set_pin_input(GPIO_TypeDef *port, uint16_t pin);
 void set_pin_pwm(GPIO_TypeDef *port, uint16_t pin, uint8_t alternate);
 void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_out);
+int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16_t pin);
 void delay_ns(uint32_t ns);
 
 /* USER CODE END PFP */
@@ -181,46 +183,46 @@ int main(void)
   	}
   	delay_us_precise(50000);
 
-  	queue_bdshot_pulse(100, true, dshot_buffer_ch1);
-  	queue_bdshot_pulse(200, true, dshot_buffer_ch2);
-  	queue_bdshot_pulse(300, true, dshot_buffer_ch3);
-  	queue_bdshot_pulse(400, true, dshot_buffer_ch4);
+  	queue_bdshot_pulse(80, true, dshot_buffer_ch1);
+  	queue_bdshot_pulse(80, true, dshot_buffer_ch2);
+  	queue_bdshot_pulse(80, true, dshot_buffer_ch3);
+  	queue_bdshot_pulse(80, true, dshot_buffer_ch4);
   	uint8_t packet_PA0[3];
   	uint8_t packet_PA1[3];
   	uint8_t packet_PA2[3];
   	uint8_t packet_PA3[3];
       for (;;){
-        while(dshot_running_ch1){delay_us_precise(5);}
+        while(dshot_running_ch1){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_1);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_0);
-        process_bdshot_telemetry(GPIOA, GPIO_PIN_0, packet_PA0);
+    	process_bdshot_telemetry(GPIOA, GPIO_PIN_0, packet_PA0);
         set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
-        delay_us_precise(60);
+        //delay_us_precise(60);
 
-        while(dshot_running_ch2){delay_us_precise(5);}
+        while(dshot_running_ch2){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_2);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_1);
-        //process_bdshot_telemetry(GPIOA, GPIO_PIN_1, packet_PA1);
+        process_bdshot_telemetry(GPIOA, GPIO_PIN_1, packet_PA1);
         set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
-        delay_us_precise(60);
+        //delay_us_precise(60);
 
-        while(dshot_running_ch3){delay_us_precise(5);}
+        while(dshot_running_ch3){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_3);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_2);
-        //process_bdshot_telemetry(GPIOA, GPIO_PIN_2, packet_PA2);
+        process_bdshot_telemetry(GPIOA, GPIO_PIN_2, packet_PA2);
         set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
-        delay_us_precise(60);
+        //delay_us_precise(60);
 
-        while(dshot_running_ch4){delay_us_precise(5);}
+        while(dshot_running_ch4){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_4);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_3);
-        //process_bdshot_telemetry(GPIOA, GPIO_PIN_3, packet_PA3);
+        process_bdshot_telemetry(GPIOA, GPIO_PIN_3, packet_PA3);
         set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
-        delay_us_precise(60);
+        //delay_us_precise(60);
 
         //HAL_UART_Transmit(&huart6, packet_PA0, 3, HAL_MAX_DELAY);
         //HAL_UART_Transmit(&huart6, packet_PA1, 3, HAL_MAX_DELAY);
@@ -480,19 +482,27 @@ int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16
     // Wait for line to go low (start bit)
     uint32_t timeout = 0;
     while (read_telemetry_pin(port, pin)) {
-        delay_us_precise(1);
-        if (++timeout > TELEMETRY_TIMEOUT_US)
+    	uint8_t rising_edge_detection_delay_dummy = 0;
+    	rising_edge_detection_delay_dummy++;
+        if (++timeout > TELEMETRY_TIMEOUT_SPINS)
             return -1; // Timeout
     }
 
-    delay_ns(500);
+    uint8_t initial_delay_dummy = 0;
+    initial_delay_dummy++;
+    initial_delay_dummy++;
+    // >2 delays yields worse results. Not sure of optimal number 0 <= x <= 2
 
     // LSB-first: capture 20 bits
     for (int i = 0; i < 20; i++) {
     	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
         value |= (read_telemetry_pin(port, pin) << (19-i)); // LSB-first
-        //delay_ns(100);
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+        uint8_t telemetry_bit_delay_dummy = 0;
+        telemetry_bit_delay_dummy++;
+        telemetry_bit_delay_dummy++;
+        //Delay functions were not precise enough -- resorted to spinning CPU with dummy variable -- found that two simple additions yields best results.
+        //delay_us_precise(TELEMETRY_BIT_US);
     }
 
     *telemetry_out = value;
@@ -507,7 +517,7 @@ void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_
     if (receive_bdshot_telemetry(&telemetry, port, pin) == 0) {
   	  uint32_t gcr = decode_gcr_mapping(telemetry);
   	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
-  		  printf("Invalid GCR encoding.\r\n");
+  		  //printf("Invalid GCR encoding.\r\n");
   		  delay_us_precise(10);
   	  }
   	  else {
@@ -517,29 +527,36 @@ void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_
           	  packet_out[0] = 0xAA;                      // Start byte
           	  packet_out[1] = rpm & 0xFF;               // LSB
           	  packet_out[2] = (rpm >> 8) & 0xFF;        // MSB
-          	  printf("PA0 RPM: %d\r\n", rpm);
-            }
+          	  /*
+          	switch(pin) {
+          	  case GPIO_PIN_0: printf("M1 RPM: %d\r\n", rpm); break;
+          	  case GPIO_PIN_1: printf("M2 RPM: %d\r\n", rpm); break;
+          	  case GPIO_PIN_2: printf("M3 RPM: %d\r\n", rpm); break;
+          	  case GPIO_PIN_3: printf("M4 RPM: %d\r\n", rpm); break;
+          	}
+          	*/
+          }
 
             else if (type == 1) {
-            	printf("EDT\r\n");
+            	//printf("EDT\r\n");
                 //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
             }
             else if (type == -1){
-                printf("Invalid Telemetry frame.\r\n");
+                //printf("Invalid Telemetry frame.\r\n");
             }
             else if (type == -2){
-            	printf("Invalid CRC.\r\n");
+            	//printf("Invalid CRC.\r\n");
             }
             else if (type == -3){
-            	printf("Something went wrong.\r\n");
+            	//printf("Something went wrong.\r\n");
             }
             else {
-            	printf("Unknown Error.\r\n");
+            	//printf("Unknown Error.\r\n");
             }
   	  }
     }
     else {
-    	printf("Invalid Telemetry.\r\n");
+    	//printf("Invalid Telemetry.\r\n");
     }
 }
 
@@ -578,6 +595,7 @@ void prepare_bdshot_buffer(uint16_t frame, uint32_t *dshot_buffer)
     dshot_buffer[buffer_index++] = 0;  // preload entry
     dshot_buffer[buffer_index++] = 0;  // preload entry
     dshot_buffer[buffer_index++] = 0;  // preload entry
+    dshot_buffer[buffer_index++] = 0;
 
     //2Build the actual DSHOT waveform entries
     for (int i = 15; i >= 0; i--)
