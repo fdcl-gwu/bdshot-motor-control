@@ -48,7 +48,8 @@
 #define DEBUG_MSG_MAX_LEN 64 //Max length for debug messages
 #define ARMING_DURATION_US 3000000 //3s for robust ESC arming
 
-#define THROTTLE_MINIMUM 70
+#define THROTTLE_MINIMUM 80
+#define THROTTLE_MAXIMUM 2047
 
 // 21 bits: 1 start (always 0), 20 data bits
 #define TELEMETRY_BITS 21
@@ -94,6 +95,14 @@ static volatile bool dshot_running_ch1 = false;       // Flag for CH1 DMA comple
 static volatile bool dshot_running_ch2 = false;       // Flag for CH2 DMA completion
 static volatile bool dshot_running_ch3 = false;       // Flag for CH3 DMA completion
 static volatile bool dshot_running_ch4 = false;       // Flag for CH4 DMA completion
+static uint32_t telemetry_M1;
+static uint32_t telemetry_M2;
+static uint32_t telemetry_M3;
+static uint32_t telemetry_M4;
+static uint16_t rpm_M1;
+static uint16_t rpm_M2;
+static uint16_t rpm_M3;
+static uint16_t rpm_M4;
 
 
 /* USER CODE END PV */
@@ -117,7 +126,7 @@ int decode_gcr_20_to_16(uint32_t input_20bit, uint16_t *out_value);
 int parse_edt_frame(uint16_t frame, char *type_out, float *value_out);
 void set_pin_input(GPIO_TypeDef *port, uint16_t pin);
 void set_pin_pwm(GPIO_TypeDef *port, uint16_t pin, uint8_t alternate);
-void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_out);
+void process_bdshot_telemetry(uint16_t pin, uint32_t telemetry, uint8_t *packet_out, uint16_t *rpm);
 int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16_t pin);
 void delay_ns(uint32_t ns);
 
@@ -183,51 +192,82 @@ int main(void)
   	}
   	delay_us_precise(50000);
 
-  	queue_bdshot_pulse(80, true, dshot_buffer_ch1);
-  	queue_bdshot_pulse(80, true, dshot_buffer_ch2);
-  	queue_bdshot_pulse(80, true, dshot_buffer_ch3);
-  	queue_bdshot_pulse(80, true, dshot_buffer_ch4);
   	uint8_t packet_PA0[3];
   	uint8_t packet_PA1[3];
   	uint8_t packet_PA2[3];
   	uint8_t packet_PA3[3];
-      for (;;){
+
+  	uint8_t rx_buf[3];
+  	uint16_t throttle_values[4] = {80, 95, 110, 125};
+
+	queue_bdshot_pulse(throttle_values[0], true, dshot_buffer_ch1);
+	queue_bdshot_pulse(throttle_values[1], true, dshot_buffer_ch2);
+	queue_bdshot_pulse(throttle_values[2], true, dshot_buffer_ch3);
+	queue_bdshot_pulse(throttle_values[3], true, dshot_buffer_ch4);
+
+      for (int i = 0; true ; i++){
         while(dshot_running_ch1){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_1);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_0);
-    	process_bdshot_telemetry(GPIOA, GPIO_PIN_0, packet_PA0);
+        receive_bdshot_telemetry(&telemetry_M1, GPIOA, GPIO_PIN_0);
         set_pin_pwm(GPIOA, GPIO_PIN_0, GPIO_AF2_TIM5);
-        //delay_us_precise(60);
 
         while(dshot_running_ch2){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_2);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_1);
-        process_bdshot_telemetry(GPIOA, GPIO_PIN_1, packet_PA1);
+        receive_bdshot_telemetry(&telemetry_M2, GPIOA, GPIO_PIN_1);
         set_pin_pwm(GPIOA, GPIO_PIN_1, GPIO_AF2_TIM5);
-        //delay_us_precise(60);
 
         while(dshot_running_ch3){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_3);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_2);
-        process_bdshot_telemetry(GPIOA, GPIO_PIN_2, packet_PA2);
+        receive_bdshot_telemetry(&telemetry_M3, GPIOA, GPIO_PIN_2);
         set_pin_pwm(GPIOA, GPIO_PIN_2, GPIO_AF2_TIM5);
-        //delay_us_precise(60);
 
         while(dshot_running_ch4){delay_us_precise(1);}
         send_bdshot(TIM_CHANNEL_4);
         delay_us_precise(40);
         set_pin_input(GPIOA, GPIO_PIN_3);
-        process_bdshot_telemetry(GPIOA, GPIO_PIN_3, packet_PA3);
+        receive_bdshot_telemetry(&telemetry_M4, GPIOA, GPIO_PIN_3);
         set_pin_pwm(GPIOA, GPIO_PIN_3, GPIO_AF2_TIM5);
-        //delay_us_precise(60);
 
-        //HAL_UART_Transmit(&huart6, packet_PA0, 3, HAL_MAX_DELAY);
-        //HAL_UART_Transmit(&huart6, packet_PA1, 3, HAL_MAX_DELAY);
-        //HAL_UART_Transmit(&huart6, packet_PA2, 3, HAL_MAX_DELAY);
-        //HAL_UART_Transmit(&huart6, packet_PA3, 3, HAL_MAX_DELAY);
+        //delay_us_precise(500);
+
+        process_bdshot_telemetry(GPIO_PIN_0, telemetry_M1, packet_PA0, &rpm_M1);
+        process_bdshot_telemetry(GPIO_PIN_1, telemetry_M2, packet_PA1, &rpm_M2);
+        process_bdshot_telemetry(GPIO_PIN_2, telemetry_M3, packet_PA2, &rpm_M3);
+        process_bdshot_telemetry(GPIO_PIN_3, telemetry_M4, packet_PA3, &rpm_M4);
+
+        if (true) { //i % 100 == 0
+        	//printf("M1 RPM: %d\r\n", rpm_M1);
+        	//printf("M2 RPM: %d\r\n", rpm_M2);
+        	//printf("M3 RPM: %d\r\n", rpm_M3);
+        	//printf("M4 RPM: %d\r\n", rpm_M4);
+            HAL_UART_Transmit(&huart6, packet_PA0, 3, HAL_MAX_DELAY);
+            HAL_UART_Transmit(&huart6, packet_PA1, 3, HAL_MAX_DELAY);
+            HAL_UART_Transmit(&huart6, packet_PA2, 3, HAL_MAX_DELAY);
+            HAL_UART_Transmit(&huart6, packet_PA3, 3, HAL_MAX_DELAY);
+        }
+
+        if ((HAL_UART_Receive(&huart6, rx_buf, 3, 1) == HAL_OK)){
+        	uint8_t motor_id = rx_buf[0];
+        	uint16_t throttle = ((uint16_t)rx_buf[2] << 8) | rx_buf[1];
+
+        	switch (motor_id){
+				case 0xB1: throttle_values[0] = throttle; break;
+				case 0xB2: throttle_values[1] = throttle; break;
+				case 0xB3: throttle_values[2] = throttle; break;
+				case 0xB4: throttle_values[3] = throttle; break;
+        	}
+
+		    queue_bdshot_pulse(throttle_values[0], true, dshot_buffer_ch1);
+		    queue_bdshot_pulse(throttle_values[1], true, dshot_buffer_ch2);
+		    queue_bdshot_pulse(throttle_values[2], true, dshot_buffer_ch3);
+		    queue_bdshot_pulse(throttle_values[3], true, dshot_buffer_ch4);
+        }
       }
   /* USER CODE END 2 */
 
@@ -491,6 +531,10 @@ int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16
     uint8_t initial_delay_dummy = 0;
     initial_delay_dummy++;
     initial_delay_dummy++;
+    initial_delay_dummy++;
+    initial_delay_dummy++;
+    initial_delay_dummy++;
+    initial_delay_dummy++;
     // >2 delays yields worse results. Not sure of optimal number 0 <= x <= 2
 
     // LSB-first: capture 20 bits
@@ -509,55 +553,46 @@ int receive_bdshot_telemetry(uint32_t *telemetry_out, GPIO_TypeDef *port, uint16
     return 0;
 }
 
-void process_bdshot_telemetry(GPIO_TypeDef *port, uint16_t pin, uint8_t *packet_out) {
-	uint32_t telemetry;
+void process_bdshot_telemetry(uint16_t pin, uint32_t telemetry, uint8_t *packet_out, uint16_t *rpm) {
 	uint16_t telemetry_16bit;
 	char telemetry_type;
 	float telemetry_value;
-    if (receive_bdshot_telemetry(&telemetry, port, pin) == 0) {
-  	  uint32_t gcr = decode_gcr_mapping(telemetry);
-  	  if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
-  		  //printf("Invalid GCR encoding.\r\n");
-  		  delay_us_precise(10);
-  	  }
-  	  else {
-            int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
-            if (type == 2) {
-          	  uint16_t rpm = (uint16_t)(telemetry_value / 7.0);
-          	  packet_out[0] = 0xAA;                      // Start byte
-          	  packet_out[1] = rpm & 0xFF;               // LSB
-          	  packet_out[2] = (rpm >> 8) & 0xFF;        // MSB
-          	  /*
-          	switch(pin) {
-          	  case GPIO_PIN_0: printf("M1 RPM: %d\r\n", rpm); break;
-          	  case GPIO_PIN_1: printf("M2 RPM: %d\r\n", rpm); break;
-          	  case GPIO_PIN_2: printf("M3 RPM: %d\r\n", rpm); break;
-          	  case GPIO_PIN_3: printf("M4 RPM: %d\r\n", rpm); break;
+  	uint32_t gcr = decode_gcr_mapping(telemetry);
+  	if (!decode_gcr_20_to_16(gcr, &telemetry_16bit)) {
+  		//printf("Invalid GCR encoding.\r\n");
+  		delay_us_precise(10);
+  	}
+  	else {
+          int type = parse_edt_frame(telemetry_16bit, &telemetry_type, &telemetry_value);
+          if (type == 2) {
+          	*rpm = (uint16_t)(telemetry_value / 7.0);
+          	switch (pin){
+				case GPIO_PIN_0: packet_out[0] = 0xA1; break;
+				case GPIO_PIN_1: packet_out[0] = 0xA2; break;
+				case GPIO_PIN_2: packet_out[0] = 0xA3; break;
+				case GPIO_PIN_3: packet_out[0] = 0xA4; break;
           	}
-          	*/
-          }
+          	packet_out[1] = *rpm & 0xFF;               // LSB
+          	packet_out[2] = (*rpm >> 8) & 0xFF;        // MSB
+        }
 
-            else if (type == 1) {
-            	//printf("EDT\r\n");
-                //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
-            }
-            else if (type == -1){
-                //printf("Invalid Telemetry frame.\r\n");
-            }
-            else if (type == -2){
-            	//printf("Invalid CRC.\r\n");
-            }
-            else if (type == -3){
-            	//printf("Something went wrong.\r\n");
-            }
-            else {
-            	//printf("Unknown Error.\r\n");
-            }
-  	  }
-    }
-    else {
-    	//printf("Invalid Telemetry.\r\n");
-    }
+          else if (type == 1) {
+        	  //printf("EDT\r\n");
+              //printf("EDT: %s = %d\r\n", telemetry_type, (int)telemetry_value);
+          }
+          else if (type == -1){
+              //printf("Invalid Telemetry frame.\r\n");
+          }
+          else if (type == -2){
+        	  //printf("Invalid CRC.\r\n");
+          }
+          else if (type == -3){
+        	  //printf("Something went wrong.\r\n");
+          }
+          else {
+        	  //printf("Unknown Error.\r\n");
+          }
+  }
 }
 
 //One cycle is ~6 ns. This is lower limit of function
