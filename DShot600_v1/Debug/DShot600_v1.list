@@ -1208,7 +1208,7 @@ int main(void)
   	uint8_t packet_PA3[3];
 
   	uint8_t rx_buf[3];
-  	uint16_t throttle_values[4] = {80, 95, 110, 125};
+  	uint16_t throttle_values[4] = {200, 95, 110, 125};
  8000e36:	4a97      	ldr	r2, [pc, #604]	@ (8001094 <main+0x31c>)
  8000e38:	463b      	mov	r3, r7
  8000e3a:	e892 0003 	ldmia.w	r2, {r0, r1}

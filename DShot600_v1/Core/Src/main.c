@@ -198,7 +198,7 @@ int main(void)
   	uint8_t packet_PA3[3];
 
   	uint8_t rx_buf[3];
-  	uint16_t throttle_values[4] = {80, 95, 110, 125};
+  	uint16_t throttle_values[4] = {200, 95, 110, 125};
 
 	queue_bdshot_pulse(throttle_values[0], true, dshot_buffer_ch1);
 	queue_bdshot_pulse(throttle_values[1], true, dshot_buffer_ch2);
